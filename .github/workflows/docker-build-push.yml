@@ -12,8 +12,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME_OPENVLA: ${{ github.repository }}-openvla
-  IMAGE_NAME_SMOLVLA: ${{ github.repository }}-smolvla
+  IMAGE_NAME_OPENVLA: cajifan/disentangledvla-openvla
+  IMAGE_NAME_SMOLVLA: cajifan/disentangledvla-smolvla
 
 jobs:
   build-and-push-openvla:
