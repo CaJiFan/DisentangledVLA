@@ -1,0 +1,13 @@
+.git
+.config
+.cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+wandb/
+runs/
+datasets/
+.nv
+# Add any other large data folders you mount via -v instead of COPYing

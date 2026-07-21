@@ -1,0 +1,2 @@
+from .TextActionDecOnlyBetaTCVAE import ConvTextActionBetaTCVAE, MLPTextActionBetaTCVAE, TCNTextActionBetaTCVAE, TCNTextActionCVAE
+from .AdvancedTextActionCVAE import TCNTextCondPriorCVAE, TCNTextWAE

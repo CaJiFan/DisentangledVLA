@@ -1,0 +1,74 @@
+# SmolVLA cache-builder container
+# ─────────────────────────────────────────────────────────────────────────────
+# Driver on host: 560.35.05  →  max supported CUDA runtime = 12.6
+# LeRobot 0.4.4 would pull torch 2.10.0+cu129 which is incompatible.
+# Fix: pre-install torch from the cu124 wheel index before lerobot runs its
+# resolver, so pip sees torch already satisfied and skips the upgrade.
+#
+# This container ONLY builds the SmolVLA embedding cache.
+# Training still runs in openvla_worker (which has the full LIBERO sim stack).
+#
+# Build:
+#   docker build -f Dockerfile.smolvla -t smolvla_worker .
+#
+# Run:
+#   docker run --gpus all --rm \
+#     -v /mnt/Data:/mnt/Data \
+#     -v $(pwd):/workspace/DisentangledVLA \
+#     -w /workspace/DisentangledVLA \
+#     smolvla_worker \
+#     python3 scripts/build_smolvla_cache.py --suite libero_spatial ...
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget curl vim ffmpeg \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ── 1. Pin torch to CUDA 12.4 BEFORE lerobot touches it ──────────────────────
+# This ensures pip's resolver considers torch already satisfied and does not
+# pull the incompatible torch+cu129 wheel that lerobot 0.4.4 would otherwise
+# request.  Force-reinstall guarantees the cu124 build wins even if pytorch
+# base image ships a slightly different minor version.
+RUN pip install --force-reinstall \
+    "torch==2.6.0" \
+    "torchvision" \
+    "torchaudio" \
+    --index-url https://download.pytorch.org/whl/cu124
+
+# ── 2. Core Python deps needed by the cache builder (VAE + CLIP) ─────────────
+RUN pip install \
+    transformers>=4.51.0 \
+    huggingface_hub>=0.27.0 \
+    accelerate \
+    "numpy<2.0" \
+    scipy \
+    h5py \
+    tqdm \
+    Pillow \
+    einops \
+    wandb \
+    clip@git+https://github.com/openai/CLIP.git
+
+# ── 3. LeRobot + SmolVLA ──────────────────────────────────────────────────────
+# --extra-index-url ensures pip can still find cu124 torch wheels if any
+# lerobot transitive dep tries to re-resolve torch.
+RUN pip install "lerobot[smolvla]" \
+    --extra-index-url https://download.pytorch.org/whl/cu124
+
+# ── 4. If torch got upgraded by lerobot, pin it back ─────────────────────────
+# Harmless no-op if lerobot respected our pre-installed version.
+RUN pip install --force-reinstall \
+    "torch==2.6.0" \
+    "torchvision" \
+    --index-url https://download.pytorch.org/whl/cu124
+
+RUN pip install robosuite==1.4.0 easydict egl_probe gym
+
+WORKDIR /workspace/DisentangledVLA
+
+CMD ["bash"]

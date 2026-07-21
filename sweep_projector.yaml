@@ -1,0 +1,43 @@
+program: scripts/train_projector.py
+project: DisentangledVLA
+method: bayes        # Bayes > grid/random: samples next config from GP posterior over test/mse_mu
+metric:
+  name: test/mse_mu  # Primary generalisation signal (KL inflates on OOD, mse_mu doesn't)
+  goal: minimize
+
+parameters:
+  # --- Fixed (not swept) ---
+  suite:
+    value: libero_spatial
+  projector_type:
+    value: prob
+  loss:
+    value: kl
+  max_steps:
+    value: 50000      # Shorter runs for sweep; best config gets full 100k as follow-up
+  batch_size:
+    value: 256
+  accum_steps:
+    value: 1
+  embed_batch_size:
+    value: 4          # Small: cache is already on disk so this is only a fallback
+  vae_checkpoint:
+    value: "./checkpoints/text_tcvae/libero_spatial/rw100_dropout0.15_beta0.1_z64_alpha1.0_chunk8_std_cyc4_vel0.5_tcn_seed_2_step_100000.pt"
+  seed:
+    value: 1
+
+  # --- Swept ---
+  normalize_emb:
+    values: [1, 0]          # highest-priority: does unit-sphere help?
+  emb_noise_std:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.05
+  dropout:
+    values: [0.1, 0.2, 0.3, 0.4]
+  lr:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-3
+  weight_decay:
+    values: [0.01, 0.05, 0.1]

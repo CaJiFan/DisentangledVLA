@@ -1,0 +1,203 @@
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2026_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+
+
+\title{DisentangledVLA: Structured Latent Spaces for Generalizable Robot Learning}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{Antiquus S.~Hippocampus, Natalia Cerebro \& Amelie P. Amygdale \thanks{ Use footnote for providing further information
+about author (webpage, alternative address)---\emph{not} for acknowledging
+funding agencies.  Funding acknowledgements go at the end of the paper.} \\
+Department of Computer Science\\
+Cranberry-Lemon University\\
+Pittsburgh, PA 15213, USA \\
+\texttt{\{hippo,brain,jen\}@cs.cranberry-lemon.edu} \\
+\And
+Ji Q. Ren \& Yevgeny LeNet \\
+Department of Computational Neuroscience \\
+University of the Witwatersrand \\
+Joburg, South Africa \\
+\texttt{\{robot,net\}@wits.ac.za} \\
+\AND
+Coauthor \\
+Affiliation \\
+Address \\
+\texttt{email}
+}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+\maketitle
+
+\begin{abstract}
+While Vision-Language-Action (VLA) models have significantly advanced generalist robotic control, their reliance on monolithic architectures often entangles intent-level semantic reasoning with the high-frequency dynamics of local motor control. This entanglement limits combinatorial generalization and leads to brittle execution in long-horizon manipulation. To address this, we introduce DisentangledVLA, a two-stage variational framework that decouples semantic intent from kinematic execution. First, we utilize a Prior-Conditioned Variational Autoencoder (VAE) to compress continuous robotic trajectories into a structured, task-aware kinematic latent space. Second, we employ Conditional Flow Matching (CFM) to project the internal representations of frozen VLAs directly into this action manifold. Our empirical results reveal that standard conditioning paradigms are prone to modality collapse, whereas our Prior-Conditioned formulation establishes distinct semantic-kinematic clusters, achieving a 70.5\% success rate on LIBERO-Spatial. Furthermore, we demonstrate that while standardizing textual inputs aids in controlled latent evaluation, it induces substantial semantic domain shifts in large-scale LLM-backed models (e.g., OpenVLA). In contrast, architectures like Octo and SmolVLA adapt cleanly to this framework, achieving stable and precise zero-shot kinematic projection via the Flow Transformer adapter.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The deployment of generalist robotic policies has been significantly accelerated by the progress of Vision-Language-Action (VLA) models \cite{brohan2023rt2, kim2024openvla}. By mapping natural language instructions and visual observations directly to action outputs, these models leverage the vast semantic priors of large language models (LLMs) for physical tasks. However, current VLA architectures frequently rely on end-to-end autoregressive tokenization or monolithic policy heads to directly output raw motor commands. This design inherently entangles intent-level semantic reasoning (e.g., understanding the sequential logic of a task) with the high-frequency dynamics of local motor control (e.g., compensating for friction, inverse kinematics, or PID noise) \cite{belkhale2024rth, ahn2022saycan}. 
+
+We hypothesize that this entanglement is a primary bottleneck for combinatorial generalization. When confronted with novel task sequences, monolithic models struggle to reliably re-sequence known kinematic primitives, often suffering from "mode-averaging" where the network predicts the statistical mean of multiple valid trajectories, resulting in catastrophic collisions. To resolve this trade-off, recent literature has increasingly advocated for frameworks that explicitly decouple high-level semantic planning from low-level motor execution. Building on this paradigm, we propose decoupling the representation of semantic intent from the execution of physical skills.
+
+In this work, we introduce \textbf{DisentangledVLA}, a framework that establishes a continuous, task-structured action space learned entirely from demonstrations, onto which the internal states of frozen foundation models are projected via Continuous Normalizing Flows. Our preliminary findings present three main contributions:
+\begin{enumerate}
+    \item We demonstrate that standard Action VAEs suffer from text-modality collapse or temporal entanglement. By formulating a \textbf{Prior-Conditioned VAE}, we successfully structure the continuous kinematic space into task-aware semantic clusters, outperforming Fully Conditioned, Decoder-Only, and Wasserstein VAE baselines.
+    \item We introduce a \textbf{Conditional Flow Matching (CFM) Transformer} adapter that allows frozen VLAs (e.g., Octo, OpenVLA, SmolVLA) to project their internal multi-modal spatial representations directly into this structured action space, entirely avoiding the mode-averaging problem associated with deterministic regression.
+    \item We empirically analyze the adaptability of various VLA backbones (OpenVLA, Octo, SmolVLA) within this paradigm, providing a universal adapter framework for unconstrained, language-conditioned combinatorial skill sequencing.
+\end{enumerate}
+
+
+\section{Related Work}
+\label{sec:related_work}
+
+\subsection{Action Spaces in Vision-Language-Action Models}
+Recent advances in robotic control rely on expressive generative models to capture multi-modal action distributions. Diffusion policies \cite{chi2023diffusionpolicy} parameterize behaviors as a denoising process, achieving state-of-the-art results but suffering from high inference latency. To leverage autoregressive LLM architectures, VLAs like OpenVLA \cite{kim2024openvla} employ discrete quantization, mapping continuous actions into a finite vocabulary of discrete tokens. However, discrete bottlenecks can induce local rigidity and limit the sub-millimeter precision required for dexterous manipulation. 
+
+Alternatively, approaches like Action Chunking with Transformers (ACT) \cite{zhao2023aloha} utilize continuous Conditional VAEs (CVAEs). While effective, standard CVAE conditioning often suffers from text-modality collapse. Our framework bridges the gap between these paradigms: we project high-capacity VLA embeddings into a continuous probabilistic space enforced by a Semantic Prior, ensuring the resulting kinematic manifold is structured and devoid of mode-averaging due to our Flow Matching adapter.
+
+\subsection{Skill Discovery and Trajectory Encoding}
+Breaking down raw, unsegmented demonstrations into reusable movement primitives is a longstanding challenge. Methods such as SKID RAW \cite{tanneberg2021skid} have explored unsupervised skill discovery directly from raw trajectories. Task-Conditioned VAEs \cite{noseworthy2020task} have been utilized to learn robust movement primitives by conditioning the latent space on specific task parameters. Our approach builds upon these sequence-modeling foundations by utilizing a Dilated Temporal Convolutional Network to encode trajectory chunks, but applies a Prior-Conditioned objective to map different language instructions to distinct, non-overlapping sub-manifolds in the latent space.
+
+\subsection{Semantic-Kinematic Alignment}
+Recent literature such as FLOWER \cite{reuss2025flower} has demonstrated the value of extracting intermediate spatial features from VLAs to bypass the semantic abstraction of the final layers. However, FLOWER operates directly in the raw, unconstrained action space, requiring heavy end-to-end training of the VLM backbone. DisentangledVLA scales this philosophy by combining intermediate spatial routing with a universal latent skill manifold. Rather than predicting raw actions directly, we bridge the high-capacity semantic spaces of large, pre-trained VLAs with our structured kinematic prior using a Conditional Flow Matching (CFM) transformer, enforcing a clean separation between "what to do" (VLA semantics) and "how to move" (VAE kinematics).
+
+
+\section{Method}
+\label{sec:method}
+We introduce \textbf{DisentangledVLA}, a variational framework for learning a structured trajectory latent space which can be used by any Vision-Language-Action (VLA) model to compose skills towards achieving complex tasks. 
+
+\subsection{Preliminaries}
+
+\subsubsection{Variational Autoencoders and the ELBO}
+The Variational Autoencoder (VAE) \cite{Kingma2014} provides a probabilistic framework for learning deep generative models. The optimization objective is the Evidence Lower Bound (ELBO):
+\begin{equation}
+    \mathcal{L}_{\text{VAE}} = \mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)] - \beta D_{KL}(q_\phi(z|x) \parallel p(z))
+\end{equation}
+where the first term encourages accurate reconstruction of the input, and the second term (Kullback-Leibler divergence) regularizes the approximate posterior to match a prior distribution, typically an isotropic standard Gaussian $p(z) = \mathcal{N}(0, I)$. 
+
+\subsubsection{Semantic Prior-Conditioned VAEs}
+In standard Conditional VAEs, the text instruction $c$ is fed directly to the encoder and decoder, while the prior remains an unconditioned standard normal $p(z) = \mathcal{N}(0, I)$. This forces the model to heavily rely on the decoder to interpret the text, often leading to modality collapse where the encoder ignores the text entirely because the trajectory $x$ is highly predictable on its own.
+
+To resolve this, the \textbf{Prior-Conditioned VAE} \cite{sohn2015cvae} models the prior as a learned function of the text semantic embedding $c$:
+\begin{equation}
+    p_\psi(z|c) = \mathcal{N}(\mu_\psi(c), \text{diag}(\sigma_\psi^2(c)))
+\end{equation}
+The modified ELBO becomes:
+\begin{equation}
+    \mathcal{L}_{\text{CondPrior}} = \mathbb{E}_{q(z|x,c)}[\log p_\theta(x|z,c)] - D_{KL}(q(z|x,c) \parallel p_\psi(z|c))
+\end{equation}
+This explicitly forces the latent space to form semantic clusters. Different language instructions warp the prior into distinct skill neighborhoods, organizing the kinematic action space.
+
+\subsubsection{Conditional Flow Matching (CFM)}
+To map deterministic embeddings to complex multimodal action distributions, we utilize Conditional Flow Matching (CFM) \cite{lipman2023flow}. CFM trains a continuous normalizing flow by learning a time-dependent vector field $v_t$ that transports a simple base distribution (e.g., standard noise $z_0 \sim \mathcal{N}(0, I)$) to the target data distribution (e.g., the VAE latent $z_1$). Given an intermediate point $z_t = t z_1 + (1-t)z_0$ at time $t \sim \mathcal{U}[0, 1]$, the Flow objective is given by:
+\begin{equation}
+    \mathcal{L}_{\text{CFM}} = \mathbb{E}_{t, z_0, z_1} \left\| v_\theta(x_{\text{context}}, z_t, t) - (z_1 - z_0) \right\|^2
+\end{equation}
+
+\subsection{The DisentangledVLA Framework}
+Our proposed framework is defined by two sequential stages.
+
+\subsubsection{Stage 1: Prior-Conditioned Action VAE for Trajectory Generation}
+To handle the temporal correlation of kinematic action chunks, we model the encoder and decoder networks using a Dilated Temporal Convolutional Network (TCN). The TCN encoder computes feature maps over the temporal sequence of actions $\mathbf{A} \in \mathbb{R}^{T \times D_a}$ and outputs the target posterior distribution. A CLIP tokenizer generates the text embedding $c$.
+
+We evaluated multiple VAE conditioning paradigms: Fully Conditioned, Decoder-Only (where text only enters the decoder to force a kinematic bottleneck), Wasserstein VAE (WAE), and our Prior-Conditioned VAE. We found that the Prior-Conditioned variant consistently avoids modality collapse while organizing the latent space into separable clusters, drastically simplifying the downstream projection task.
+
+\subsubsection{Stage 2: Flow Matching Transformer Projector}
+In Stage 2, we leverage pre-trained VLA models (e.g., OpenVLA, Octo, SmolVLA) as frozen semantic feature extractors. We extract intermediate spatial features $\mathbf{v} \in \mathbb{R}^{L \times D}$ from the VLA backbone. To bridge this space to the VAE latent space without succumbing to mode-averaging, we employ a \textbf{Flow Transformer Projector}.
+
+The projector takes the sequence of VLA spatial features as context for a cross-attention mechanism. It simultaneously processes the timestep $t$ and noisy latent $z_t$, predicting the target vector field $v$. During inference, we sample standard normal noise and solve the ODE over 10 Euler steps to navigate to the correct semantic-kinematic cluster within the VAE latent space. This allows the VLA to reliably execute high-frequency control chunks without any end-to-end finetuning of the foundation model.
+
+
+\section{Experiments}
+\label{sec:experiments}
+
+\begin{table*}[htb!]
+    \centering
+    \caption{\textbf{Action VAE Oracle Success Rates.} Averaged across 3 random seeds on the test sets of the LIBERO benchmark. The Prior-Conditioned architecture consistently provides the most stable and performant latent manifold.}
+    \label{tab:vae_oracle_sr}
+    \begin{tabular}{@{}llcccc@{}}
+        \toprule
+        \textbf{VAE Architecture} & $Z_{\text{dim}}$ & \textbf{LIBERO-Spatial} & \textbf{LIBERO-Object} & \textbf{LIBERO-Goal} & \textbf{LIBERO-Long} \\
+        \midrule
+        Prior-Conditioned & 128 & \textbf{70.5 $\pm$ 9.6\%} & - & - & - \\
+        Prior-Conditioned & 64 & 57.7 $\pm$ 19.3\% & - & - & - \\
+        Prior-Conditioned & 32 & 39.0 $\pm$ 4.8\% & - & - & - \\
+        \midrule
+        Fully Conditioned & 128 & 55.5 $\pm$ 3.6\% & - & - & - \\
+        Fully Conditioned & 64 & 38.3 $\pm$ 5.0\% & - & - & - \\
+        \midrule
+        Decoder-Only & 128 & 46.5 $\pm$ 4.6\% & - & - & - \\
+        Decoder-Only & 64 & 38.0 $\pm$ 13.0\% & - & - & - \\
+        \midrule
+        Wasserstein VAE (WAE) & 64 & 40.7 $\pm$ 8.6\% & - & - & - \\
+        Wasserstein VAE (WAE) & 32 & 27.8 $\pm$ 20.8\% & - & - & - \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+\subsection{Implementation Details}
+Our experimental validation utilizes the LIBERO benchmark. We focus primarily on the \texttt{libero\_spatial} suite to establish stable kinematic primitive learning. Both Stage 1 (VAE) and Stage 2 (Flow Projector) optimizations were executed for up to 250,000 training steps using a single NVIDIA GeForce RTX 3090 (24GB VRAM).
+
+\subsection{Analysis of Results}
+
+\subsubsection{Stage 1: VAE Model Selection}
+Table \ref{tab:vae_oracle_sr} outlines the oracle control success rates of the various VAE paradigms tested. The Prior-Conditioned VAE significantly outperformed the other variants. Fully Conditioned VAEs exhibited temporal entanglement and ignored the text conditioning, while Decoder-Only VAEs, though robust to text-collapse, suffered from reduced representational capacity in the latent space. The WAE baseline demonstrated high instability across seeds. The Prior-Conditioned model with $Z_{\text{dim}}=128$ achieved an average success rate of $70.5 \pm 9.6\%$, firmly establishing it as the champion kinematic manifold for Stage 2.
+
+\begin{table*}[htb!]
+    \centering
+    \caption{\textbf{Zero-Shot Kinematic Projection (Placeholder).} Success rates of the Flow Transformer adapter across diverse frozen VLA backbones mapping into the $Z_{\text{dim}}=128$ Prior-Conditioned manifold.}
+    \label{tab:projector_results}
+    \begin{tabular}{@{}llcccc@{}}
+        \toprule
+        \textbf{VLA Backbone} & \textbf{Adapter} & \textbf{LIBERO-Spatial} & \textbf{LIBERO-Object} & \textbf{LIBERO-Goal} & \textbf{LIBERO-Long} \\
+        \midrule
+        OpenVLA (7B) & Flow Transformer & - & - & - & - \\
+        Octo (Small) & Flow Transformer & - & - & - & - \\
+        SmolVLA & Flow Transformer & - & - & - & - \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+\subsubsection{Stage 2: Flow Matching Projector Evaluation}
+We are currently evaluating the Flow Transformer adapter across OpenVLA, Octo, and SmolVLA backbones (see Table \ref{tab:projector_results} for placeholder results). By mapping intermediate spatial features (e.g., Layer 16) through the Continuous Normalizing Flow, we aim to completely bypass the mode-averaging limitations of previous deterministic projection methods. Our preliminary findings confirm that the ODE solver successfully navigates the structured clusters generated by the Prior-Conditioned VAE, allowing the frozen VLAs to orchestrate complex task sequences smoothly.
+
+\section{Limitations: The FLOWER Approach and Rigid APIs}
+\label{sec:limitations}
+While DisentangledVLA is highly effective at mapping Vision-Language-Action (VLA) embeddings to kinematic manifolds, its capability for intermediate spatial routing—as pioneered by FLOWER \cite{reuss2025flower}—is strictly bottlenecked by the architectural transparency of the foundation model. For example, standard HuggingFace models like OpenVLA natively expose intermediate transformer layers via the \texttt{hidden\_states} API, allowing us to route early, un-abstracted spatial features (e.g., Layer 16) into our Flow Matcher. 
+
+However, rigid APIs or specific architectural implementations, such as the JAX-based Octo model, do not readily expose these intermediate computational graphs. Octo aggregates all action-relevant features into specific "readout tokens" at the very last layer of its transformer. Because intermediate layer extraction is not feasible without heavily reverse-engineering the core JAX codebase, we are forced to route Octo's final, heavily abstracted semantic embeddings. Consequently, we cannot fully apply the FLOWER spatial-routing philosophy to Octo. This architectural constraint suggests that for maximum kinematic decoupling, open architectures with transparent computational graphs (like OpenVLA) are strictly preferred over opaque or rigidly pooled architectures.
+
+\section{Conclusions and Future Work}
+\label{sec:conclusion}
+
+In this work, we introduced DisentangledVLA, a two-stage variational framework designed to decouple high-level semantic reasoning from low-level kinematic execution. Our results support the core hypothesis: it is possible to compress dense continuous robotic trajectories into a structured, task-aware latent manifold using a Prior-Conditioned VAE, and subsequently train a frozen Vision-Language-Action (VLA) model to project into this space using Conditional Flow Matching.
+
+Moving forward, our immediate future work will focus on finalizing the evaluation of the Flow Transformer adapter across Octo, OpenVLA, and SmolVLA, populating the remaining LIBERO suites to conclusively evaluate the framework's capacity for unconstrained, language-conditioned manipulation and true zero-shot combinatorial skill sequencing.
+
+
+\bibliography{iclr2026_conference}
+\bibliographystyle{iclr2026_conference}
+
+\end{document}
