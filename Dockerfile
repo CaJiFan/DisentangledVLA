@@ -51,12 +51,15 @@ RUN python3.10 -m pip install mujoco
 
 # --- 3. Install Projects ---
 # --- LIBERO ---
-# RUN git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+WORKDIR $HOME/benchmarks
+RUN git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
 WORKDIR $HOME/benchmarks/LIBERO
 RUN python3.10 -m pip install -r requirements.txt
 RUN python3.10 -m pip install -e . --config-settings editable_mode=compat
 
 # --- Octo (Your project) ---
+WORKDIR $HOME/vlas
+RUN git clone https://github.com/octo-models/octo.git
 WORKDIR $HOME/vlas/octo
 RUN python3.10 -m pip install -r requirements.txt
 RUN python3.10 -m pip install -e .
@@ -68,7 +71,8 @@ WORKDIR /workspace
 RUN python3.10 -m pip install dm_control ipython
 
 # --- OpenVLA-OFT ---
-# RUN git clone https://github.com/moojink/openvla-oft.git
+WORKDIR $HOME/vlas
+RUN git clone https://github.com/moojink/openvla-oft.git
 WORKDIR $HOME/vlas/openvla_oft
 RUN python3.10 -m pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 orbax-checkpoint==0.4.0 draccus
 RUN python3.10 -m pip install numpy==1.24.1 scipy==1.10.0 diffusers==0.30.3 json-numpy==2.1.1 timm==0.9.10 jsonlines wandb==0.13.1 einops==0.8.1 peft==0.11.1 gym==0.26.2 robosuite==1.4.0 egl_probe==1.0.2 huggingface-hub==0.36.0 pillow==12.0.0
