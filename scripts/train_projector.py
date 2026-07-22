@@ -94,7 +94,7 @@ def parse_args():
     
     # Training Hyperparams
     parser.add_argument("--batch_size", type=int, default=256)  # TensorDataset — no VLA bottleneck
-    parser.add_argument("--max_steps", type=int, default=100_000)
+    parser.add_argument("--max_steps", type=int, default=200_000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--auto_resume", type=int, default=1, help="If 1, auto-resume from latest checkpoint for this config")
     parser.add_argument("--resume_step", type=int, default=0, help="Manual override to resume from specific step")
@@ -355,6 +355,13 @@ def train_projector():
             try:
                 c = torch.load(p, map_location="cpu")
                 if "train_actions" in c:
+                    # Enforce Protocol isolation (don't mix protA and protB caches!)
+                    has_test_split = len(c.get("test_emb", [])) > 0
+                    if args.train_split_ratio is None and has_test_split:
+                        continue # Skip protB cache when running protA
+                    if args.train_split_ratio is not None and not has_test_split:
+                        continue # Skip protA cache when running protB
+                        
                     return p
             except Exception:
                 continue
