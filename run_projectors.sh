@@ -5,6 +5,9 @@ echo "🚀 STARTING VLA PROJECTOR ABLATION PIPELINE"
 echo "   Protocol A: 10-task training, simulator eval only"
 echo "=================================================="
 
+# Fix W&B Git "dubious ownership" crash inside Docker
+git config --global --add safe.directory '*' || true
+
 wait_for_queue() {
     # Block until previous background job finishes.
     while [ $(jobs -p | wc -l) -ge 1 ]; do
