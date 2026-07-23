@@ -690,7 +690,7 @@ def train_projector():
                     pbar.set_description(f"Loss(MSE): {accum_loss:.4f} | CosSim: {accum_cos_sim:.3f}")
                     if args.use_wandb:
                         wandb.log({"train/loss_total": accum_loss, "train/cos_sim": accum_cos_sim,
-                                "train/learning_rate": current_lr, "global_step": steps})
+                                "train/learning_rate": current_lr, "global_step": steps}, step=steps)
                 elif args.projector_type == "prob":
                     pbar.set_description(f"Loss({args.loss.upper()}): {accum_loss:.4f} | MSE(μ): {accum_mse_mu:.4f} | pred_lv: {accum_pred_logvar:.2f} | tgt_lv: {accum_logvar:.2f}")
                     if args.use_wandb:
@@ -701,7 +701,7 @@ def train_projector():
                                 "global_step": steps}
                         if args.action_recon_weight > 0.0:
                             log_entry["train/action_recon_loss"] = accum_recon_loss
-                        wandb.log(log_entry)
+                        wandb.log(log_entry, step=steps)
 
                 pbar.update(1)
                 if steps % 1000 == 0: gc.collect()
@@ -760,7 +760,7 @@ def train_projector():
                                 log_dict["test/teacher_logvar"]= sum(test_teacher_logvars) / len(test_teacher_logvars)
                                 log_dict["test/action_mse"]    = sum(test_action_mses)     / len(test_action_mses)
                                 log_dict["test/z_pred_norm"]   = sum(test_z_mean_norms)    / len(test_z_mean_norms)
-                            wandb.log(log_dict)
+                            wandb.log(log_dict, step=steps)
                     # Protocol A: no test dataloader — skip eval loop.
                     # Convergence is monitored via train/* metrics; evaluation via simulator.
 
