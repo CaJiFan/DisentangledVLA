@@ -1,6 +1,61 @@
 import math
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+
+def compute_supcon_loss(
+    z: torch.Tensor,
+    task_ids: torch.Tensor,
+    temperature: float = 0.07,
+) -> torch.Tensor:
+    """
+    Supervised Contrastive Loss (SupCon, Khosla et al., NeurIPS 2020).
+
+    Pulls z's from the same task together and pushes z's from different
+    tasks apart, using all within-batch (anchor, positive) pairs.
+
+    Critical for forcing task-discriminative structure into z when the
+    decoder's text conditioning would otherwise let z collapse to noise.
+
+    Args:
+        z:          (B, Z) latent codes (z samples or mu — either works)
+        task_ids:   (B,)   integer task labels (0-indexed)
+        temperature: controls sharpness of the similarity distribution
+
+    Returns:
+        Scalar loss tensor. Returns 0.0 if no anchor has a positive pair.
+    """
+    B = z.shape[0]
+    z_norm = F.normalize(z, dim=1)                                  # (B, Z)
+
+    # Pairwise cosine similarity matrix, scaled by temperature
+    sim = torch.matmul(z_norm, z_norm.T) / temperature              # (B, B)
+
+    # Numerical stability: shift by row-max (doesn't change softmax)
+    sim = sim - sim.max(dim=1, keepdim=True).values.detach()
+
+    # Positive mask: same task, excluding self
+    task_col = task_ids.view(-1, 1)                                  # (B, 1)
+    pos_mask = (task_col == task_ids.view(1, -1)).float()            # (B, B)
+    pos_mask.fill_diagonal_(0)
+
+    # Denominator: sum over all non-self pairs
+    exp_sim = torch.exp(sim)
+    self_mask = torch.eye(B, device=z.device, dtype=torch.bool)
+    exp_sim = exp_sim.masked_fill(self_mask, 0.0)
+    log_denom = torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)  # (B, 1)
+
+    # Per-anchor loss: mean of -log(exp(sim_pos) / sum_all) over positives
+    log_prob = sim - log_denom                                       # (B, B)
+    n_pos = pos_mask.sum(dim=1)                                      # (B,)
+    has_pos = n_pos > 0
+
+    if not has_pos.any():
+        return z.sum() * 0.0  # zero with gradient graph intact
+
+    per_anchor = -(log_prob * pos_mask).sum(dim=1) / (n_pos + 1e-8)  # (B,)
+    return per_anchor[has_pos].mean()
 
 
 def compute_mig(z_means: torch.Tensor, labels: torch.Tensor, num_bins: int = 20) -> float:
@@ -70,6 +125,60 @@ def compute_mig(z_means: torch.Tensor, labels: torch.Tensor, num_bins: int = 20)
     return float(np.clip(mig, 0.0, 1.0))
 
 
+def get_beta_schedule(
+    step: int,
+    max_steps: int,
+    beta_max: float,
+    n_cycles: int = 0,
+    warmup_ratio: float = 0.05,
+    schedule_type: str = "warmup",
+    beta_high: float = 1.0,
+) -> float:
+    """
+    Beta annealing/scheduling strategies for VAEs/CVAEs.
+
+    Supports 4 major paradigms from literature:
+      1. 'fixed': Constant beta = beta_max throughout training.
+      2. 'warmup': Low-to-high linear warmup from 0 -> beta_max over the first
+                  `warmup_ratio` fraction of steps (e.g., first 5%), then fixed.
+                  (Bowman et al. 2016 / Sønderby et al. 2016)
+      3. 'high_to_low': Starts at `beta_high` early in training to force high-level
+                        disentanglement/task separation in z, then decays down to
+                        `beta_max` (or lower) over the first `warmup_ratio` fraction
+                        so decoder can focus on fine-grained trajectory reconstruction.
+                        (Burgess et al. 2018 "Understanding disentangling in beta-VAE")
+      4. 'cyclic': Cyclical cosine annealing over `n_cycles` periods (Fu et al. 2019).
+    """
+    if schedule_type == "fixed":
+        return float(beta_max)
+
+    if schedule_type == "high_to_low":
+        warmup_steps = max(1, int(max_steps * warmup_ratio))
+        if step < warmup_steps:
+            # Linear decay from beta_high down to beta_max
+            progress = step / warmup_steps
+            return float(beta_high - progress * (beta_high - beta_max))
+        else:
+            return float(beta_max)
+
+    if schedule_type == "warmup" or n_cycles <= 0:
+        warmup_steps = max(1, int(max_steps * warmup_ratio))
+        if step < warmup_steps:
+            return float(beta_max * (step / warmup_steps))
+        else:
+            return float(beta_max)
+
+    # Cyclical schedule (Fu et al., NAACL 2019)
+    period = max_steps / n_cycles
+    cycle_pos = step % period
+    ramp_end = warmup_ratio * period
+
+    if cycle_pos < ramp_end:
+        return float(beta_max * 0.5 * (1.0 - math.cos(math.pi * cycle_pos / ramp_end)))
+    else:
+        return float(beta_max)
+
+
 def cyclic_beta_schedule(
     step: int,
     max_steps: int,
@@ -77,36 +186,8 @@ def cyclic_beta_schedule(
     n_cycles: int = 4,
     warmup_ratio: float = 0.5,
 ) -> float:
-    """
-    Cyclic cosine beta annealing schedule (Li et al., "Don't Blame the ELBO", 2019).
-
-    Divides training into `n_cycles` equal periods. Within each period:
-      - First `warmup_ratio` fraction: beta ramps 0 → beta_max via a cosine curve.
-      - Remaining fraction:            beta stays at beta_max.
-
-    This lets the model re-learn good reconstruction at the start of every cycle,
-    then be pushed toward disentanglement in the plateau phase, repeatedly.
-
-    Args:
-        step:          current training step (0-indexed)
-        max_steps:     total number of training steps
-        beta_max:      peak beta value (your --beta argument)
-        n_cycles:      number of complete cycles over max_steps (default 4)
-        warmup_ratio:  fraction of each cycle used for ramping (default 0.5)
-
-    Returns:
-        current beta value (float)
-    """
+    """Backward-compatible wrapper for cyclic_beta_schedule."""
     if n_cycles <= 0:
-        # Fallback: original linear single-shot warmup
-        warmup = max(1, int(max_steps * warmup_ratio))
-        return beta_max * min(1.0, step / warmup)
+        return get_beta_schedule(step, max_steps, beta_max, n_cycles=0, warmup_ratio=0.05, schedule_type="warmup")
+    return get_beta_schedule(step, max_steps, beta_max, n_cycles=n_cycles, warmup_ratio=warmup_ratio, schedule_type="cyclic")
 
-    period = max_steps / n_cycles
-    cycle_pos = step % period
-    ramp_end = warmup_ratio * period
-
-    if cycle_pos < ramp_end:
-        return beta_max * 0.5 * (1.0 - math.cos(math.pi * cycle_pos / ramp_end))
-    else:
-        return beta_max

@@ -56,8 +56,8 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 from transformers import CLIPTokenizer, CLIPTextModel
-
 from src.disentanglers import TCNTextActionBetaTCVAE, TCNTextActionCVAE
+from src.disentanglers.AdvancedTextActionCVAE import TCNTextCondPriorCVAE
 
 # ---------------------------------------------------------------------------
 # Config
@@ -79,7 +79,7 @@ def parse_args():
     p.add_argument("--vae_checkpoint", type=str, required=False)
     p.add_argument("--out_dir",        type=str, default="./checkpoints/projectors/smolvla")
     p.add_argument("--vae_type",       type=str, default="text_cond_beta_tcvae",
-                   choices=["text_cond_beta_tcvae", "text_cvae"])
+                   choices=["text_cond_beta_tcvae", "text_cvae", "cond_prior"])
     p.add_argument("--vae_seed",       type=int, default=2)
     p.add_argument("--beta",           type=float, default=0.001)
     p.add_argument("--z_dim",          type=int,   default=128)
@@ -89,6 +89,9 @@ def parse_args():
     p.add_argument("--embed_batch_size", type=int, default=8,
                    help="Batch size for SmolVLA forward pass.")
     p.add_argument("--vla_layer_idx",  type=int, default=-1, help="Which VLA layer to tap (e.g. 16 for intermediate, -1 for last)")
+    p.add_argument("--num_fusion_layers", type=int, default=1, help="Number of intermediate layers to extract. Overrides vla_layer_idx if > 1.")
+    p.add_argument("--train_split_ratio", type=int, default=None,
+                   help="Number of tasks in train split. If None, all tasks go to train (Protocol A).")
     p.add_argument("--emb_cache_from", type=str, default=None,
                    help="Path to an existing cache .pt to reuse train_emb/test_emb/"
                         "train_actions/test_actions/train_clip_emb/test_clip_emb. "
@@ -144,7 +147,7 @@ def load_suite(suite: str):
 #    Shape: (N, 960)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def embed_smolvla(policy, images_np, instructions, batch_size=8, device=DEVICE, layer_idx=-1):
+def embed_smolvla(policy, images_np, instructions, batch_size=8, device=DEVICE, layer_idx=-1, num_fusion_layers=1):
     from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
 
     flow = policy.model            # VLAFlowMatching
@@ -157,12 +160,34 @@ def embed_smolvla(policy, images_np, instructions, batch_size=8, device=DEVICE, 
     _resize = getattr(policy.config, "resize_imgs_with_padding", None) or (256, 256)
     _tgt_h, _tgt_w = _resize  # PIL.resize takes (width, height)
 
-    target_layer = vlm.vlm.model.layers[layer_idx]
+    if num_fusion_layers > 1:
+        total_layers = 16
+        step = total_layers // (num_fusion_layers + 1)
+        target_indices = [step * (i + 1) - 1 for i in range(num_fusion_layers)]
+    else:
+        target_indices = [layer_idx]
+
     captured = {}
-    def hook_fn(module, input, output):
-        hs = output[0] if isinstance(output, tuple) else output
-        captured['hs'] = hs.float().detach().cpu()
-    handle = target_layer.register_forward_hook(hook_fn)
+    handles = []
+
+    def make_hook_fn(layer_idx_key):
+        def hook_fn(module, args):
+            hs = args[0]
+            captured[layer_idx_key] = hs.float().detach().cpu()
+        return hook_fn
+
+    for l_idx in target_indices:
+        actual_idx = l_idx if l_idx != -1 else 15
+        if hasattr(vlm.vlm.model, "text_model") and hasattr(vlm.vlm.model.text_model, "layers"):
+            target_layer = vlm.vlm.model.text_model.layers[actual_idx].input_layernorm
+            handle = target_layer.register_forward_pre_hook(make_hook_fn(l_idx))
+        else:
+            target_layer = vlm.vlm.model.layers[actual_idx]
+            def legacy_hook_fn(module, input, output, key=l_idx):
+                hs = output[0] if isinstance(output, tuple) else output
+                captured[key] = hs.float().detach().cpu()
+            handle = target_layer.register_forward_hook(legacy_hook_fn)
+        handles.append(handle)
 
     all_embs = []
     for i in tqdm.tqdm(range(0, len(images_np), batch_size), desc="SmolVLA embed"):
@@ -214,33 +239,43 @@ def embed_smolvla(policy, images_np, instructions, batch_size=8, device=DEVICE, 
         pos_ids = torch.cumsum(prefix_pad, dim=1) - 1
 
         # ── VLM forward (prefix only — action expert skipped) ─────────────
-        # fill_kv_cache=True forces all layers through forward_attn_layer,
+        # use_cache=True forces all layers through forward_attn_layer,
         # which handles None gracefully (line ~215: "if hidden_states is None: continue").
-        # fill_kv_cache=False would route cross-attention layers to
+        # use_cache=False would route cross-attention layers to
         # forward_cross_attn_layer, which unconditionally accesses inputs_embeds[1]
-        # and crashes on None.  With use_cache=False no KV cache is actually built.
+        # and crashes on None.
         # Returns ((prefix_out, None), past_kv)
         (prefix_out, _), _ = vlm.forward(
             attention_mask=att_2d,
             position_ids=pos_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
-            use_cache=False,
-            fill_kv_cache=True,
+            use_cache=True,
         )
         
-        prefix_out = captured['hs']
-
-        # ── Mean-pool over valid prefix token positions ────────────────────
-        # prefix_out: (B, seq_len, 960)
-        valid = prefix_pad.unsqueeze(-1).float()          # (B, seq_len, 1)
-        emb   = (prefix_out.float() * valid).sum(1) / valid.sum(1).clamp(min=1)
+        valid = prefix_pad.unsqueeze(-1).float().cpu()          # (B, seq_len, 1)
+        if num_fusion_layers > 1:
+            batch_layer_embs = []
+            for l_idx in target_indices:
+                prefix_out = captured[l_idx]
+                emb = (prefix_out.float() * valid).sum(1) / valid.sum(1).clamp(min=1)
+                batch_layer_embs.append(emb)
+            emb = torch.stack(batch_layer_embs, dim=1)  # (B, num_fusion_layers, 960)
+        else:
+            prefix_out = captured[target_indices[0]]
+            emb = (prefix_out.float() * valid).sum(1) / valid.sum(1).clamp(min=1)  # (B, 960)
+            
         all_embs.append(emb.cpu())
-        
-        captured.pop('hs', None)
+        captured.clear()
 
-    handle.remove()
-    return torch.cat(all_embs, dim=0)   # (N, 960)
+    for h in handles:
+        h.remove()
+    if not all_embs:
+        if num_fusion_layers > 1:
+            return torch.empty(0, num_fusion_layers, 960)
+        else:
+            return torch.empty(0, 960)
+    return torch.cat(all_embs, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +361,9 @@ def embed_vla_text_backbone(instructions, text_backbone, device):
     del text_encoder, tokenizer
     torch.cuda.empty_cache()
     
+    if not all_embs:
+        text_dim = {"clip": 512, "smollm": 960, "openvla_llama": 4096}.get(text_backbone, 512)
+        return torch.empty(0, text_dim)
     return torch.stack(all_embs)
 
 
@@ -334,10 +372,13 @@ def embed_vla_text_backbone(instructions, text_backbone, device):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def encode_teacher_vae(vae, actions_tensor, vae_type, device, batch_size=256, text_emb_dim=512, text_emb=None):
+    if len(actions_tensor) == 0:
+        latent_dim = getattr(vae, "latent_dim", 128)
+        return torch.empty(0, latent_dim), torch.empty(0, latent_dim)
     all_mu, all_lv = [], []
     for i in tqdm.tqdm(range(0, len(actions_tensor), batch_size), desc="VAE teacher"):
         a = actions_tensor[i:i + batch_size].to(device)
-        if vae_type == "text_cond_beta_tcvae":
+        if vae_type in ["text_cond_beta_tcvae", "cond_prior"]:
             mu, lv = vae.encode(a)
         else:
             zero_t = torch.zeros(a.size(0), text_emb_dim, device=a.device)
@@ -370,6 +411,8 @@ def load_action_stats(suite):
 
 def normalise_actions(actions_np, a_min, a_max, mask):
     """Min-max normalise to [-1, 1]; masked dims (gripper) kept raw."""
+    if len(actions_np) == 0:
+        return torch.empty(0, 8, 7)
     actions = torch.from_numpy(actions_np).float()   # (N, T, 7)
     if a_min is None:
         return actions
@@ -390,11 +433,14 @@ def main():
     args  = parse_args()
     BETA  = args.beta
     Z_DIM = args.z_dim
-    _vae_arch = {"text_cond_beta_tcvae": "tcn", "text_cvae": "cvae"}.get(args.vae_type, "")
+    _vae_arch = {"text_cond_beta_tcvae": "tcn", "text_cvae": "cvae", "cond_prior": "cond_prior"}.get(args.vae_type, "")
     _cache_suffix = f"_arch_{_vae_arch}_beta{BETA}_z{Z_DIM}"
     out_dir  = os.path.join(args.out_dir, args.suite)
     os.makedirs(out_dir, exist_ok=True)
-    _layer_suffix = f"_layer{args.vla_layer_idx}" if args.vla_layer_idx != -1 else ""
+    if args.num_fusion_layers > 1:
+        _layer_suffix = f"_fusion{args.num_fusion_layers}"
+    else:
+        _layer_suffix = f"_layer{args.vla_layer_idx}" if args.vla_layer_idx != -1 else ""
     _seed_suffix = f"_seed{args.vae_seed}"
     out_path = os.path.join(out_dir, f"vla_emb_cache_{args.vae_type}{_cache_suffix}_text_{args.text_backbone}{_seed_suffix}{_layer_suffix}.pt")
 
@@ -411,8 +457,12 @@ def main():
     # ── Load HDF5 data ────────────────────────────────────────────────────
     task_dict = load_suite(args.suite)
     task_names = sorted(task_dict.keys())
-    train_tasks = task_names[:TRAIN_SPLIT]
-    test_tasks  = task_names[TRAIN_SPLIT:]
+    if args.train_split_ratio is None:
+        train_tasks = task_names
+        test_tasks  = []
+    else:
+        train_tasks = task_names[:args.train_split_ratio]
+        test_tasks  = task_names[args.train_split_ratio:]
     print(f"Tasks — train: {len(train_tasks)}, test: {len(test_tasks)}")
 
     def collect(tasks):
@@ -458,10 +508,10 @@ def main():
         print(f"   image resize  : {_resize_cfg}  (from policy.config.resize_imgs_with_padding)")
 
         # ── SmolVLA embedding pass ────────────────────────────────────────
-        print(f"🧠 Generating SmolVLA embeddings from layer {args.vla_layer_idx}...")
+        print(f"🧠 Generating SmolVLA embeddings from layer {args.vla_layer_idx} (fusion={args.num_fusion_layers})...")
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            tr_emb = embed_smolvla(policy, tr_imgs, tr_instrs, args.embed_batch_size, DEVICE, args.vla_layer_idx)
-            te_emb = embed_smolvla(policy, te_imgs, te_instrs, args.embed_batch_size, DEVICE, args.vla_layer_idx)
+            tr_emb = embed_smolvla(policy, tr_imgs, tr_instrs, args.embed_batch_size, DEVICE, args.vla_layer_idx, args.num_fusion_layers)
+            te_emb = embed_smolvla(policy, te_imgs, te_instrs, args.embed_batch_size, DEVICE, args.vla_layer_idx, args.num_fusion_layers)
 
         # ── CLIP embeddings ───────────────────────────────────────────────
         tr_text_embs = embed_vla_text_backbone(tr_instrs, args.text_backbone, DEVICE)
@@ -477,11 +527,14 @@ def main():
 
     # ── Load VAE and encode teacher targets ───────────────────────────────
     # vae_checkpoint = f'checkpoints/text_tcvae/libero_spatial/rw100_dropout0.15_beta{args.beta}_z{args.z_dim}_alpha1.0_chunk8_std_cyc4_vel0.5_{_vae_arch}_seed_{args.vae_seed}_step_{STEP}.pt'
-    if args.text_backbone == "clip":
-        # Legacy CLIP checkpoints don't have 'text_clip' in the filename
-        vae_checkpoint = f'checkpoints/text_tcvae/libero_spatial/rw100_dropout0.15_beta{args.beta}_z{args.z_dim}_alpha1.0_chunk8_std_cyc4_vel0.5_{_vae_arch}_seed_{args.vae_seed}_step_{STEP}.pt'
+    if args.vae_checkpoint:
+        vae_checkpoint = args.vae_checkpoint
     else:
-        vae_checkpoint = f'checkpoints/text_tcvae/libero_spatial/rw100_dropout0.15_beta{args.beta}_z{args.z_dim}_alpha1.0_chunk8_std_text_{args.text_backbone}_seed_{args.vae_seed}_cyc4_vel0.5_{_vae_arch}_seed_{args.vae_seed}_step_{STEP}.pt'
+        if args.text_backbone == "clip":
+            # Legacy CLIP checkpoints don't have 'text_clip' in the filename
+            vae_checkpoint = f'checkpoints/text_tcvae/libero_spatial/rw100_dropout0.15_beta{args.beta}_z{args.z_dim}_alpha1.0_chunk8_std_cyc4_vel0.5_{_vae_arch}_seed_{args.vae_seed}_step_{STEP}.pt'
+        else:
+            vae_checkpoint = f'checkpoints/text_tcvae/libero_spatial/rw100_dropout0.15_beta{args.beta}_z{args.z_dim}_alpha1.0_chunk8_std_text_{args.text_backbone}_seed_{args.vae_seed}_cyc4_vel0.5_{_vae_arch}_seed_{args.vae_seed}_step_{STEP}.pt'
     
     if not os.path.exists(vae_checkpoint):
         raise FileNotFoundError(f"❌ VAE checkpoint not found: {vae_checkpoint}")
@@ -497,6 +550,12 @@ def main():
             action_dim=ACTION_DIM, chunk_size=CHUNK_SIZE, latent_dim=Z_DIM,
             text_emb_dim=text_emb_dim, beta=BETA, dropout=VAE_DROPOUT,
             hidden_channels=64, n_blocks=N_BLOCKS, enc_text_gate_init=0.0,
+        ).to(DEVICE)
+    elif args.vae_type == "cond_prior":
+        vae = TCNTextCondPriorCVAE(
+            action_dim=ACTION_DIM, chunk_size=CHUNK_SIZE, latent_dim=Z_DIM,
+            text_emb_dim=text_emb_dim, beta=BETA, dropout=VAE_DROPOUT,
+            hidden_channels=64, n_blocks=N_BLOCKS,
         ).to(DEVICE)
 
     vae.load_state_dict(torch.load(vae_checkpoint, map_location=DEVICE, weights_only=False))

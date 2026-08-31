@@ -13,9 +13,12 @@ class TCNTextCondPriorCVAE(nn.Module):
     The encoder is text-free: q(z | action) = N(mu_q, logvar_q).
     The KL divergence is calculated between q(z | action) and p(z | text).
     """
-    def __init__(self, action_dim=7, chunk_size=8, latent_dim=128, text_emb_dim=512, 
-                 beta=0.1, dropout=0.15, hidden_channels=64, n_blocks=4):
+    def __init__(self, action_dim=7, chunk_size=8, latent_dim=128, text_emb_dim=512,
+                 beta=0.1, dropout=0.15, hidden_channels=64, n_blocks=4,
+                 prior_hidden_dim=512, use_state=False, state_dim=8):
         super().__init__()
+        self.use_state = use_state
+        self.state_dim = state_dim
         self.latent_dim = latent_dim
         self.chunk_size = chunk_size
         self.action_dim = action_dim
@@ -37,24 +40,40 @@ class TCNTextCondPriorCVAE(nn.Module):
             DilatedResBlock(hidden_channels, kernel_size, dilation=2**i, dropout=dropout)
             for i in range(n_blocks)
         ])
-        self.enc_norm = nn.GroupNorm(8, hidden_channels)
+        self.enc_norm = nn.Sequential(nn.GroupNorm(8, hidden_channels), nn.GELU())
         self.fc_mu_q = nn.Linear(hidden_channels, latent_dim)
         self.fc_logvar_q = nn.Linear(hidden_channels, latent_dim)
 
+        # Attention pooling: a learned CLS-like query cross-attends over the T timestep
+        # features, replacing global avg pool. Lets the encoder focus on task-critical
+        # timesteps (e.g. grasp approach) instead of weighting all frames equally.
+        _n_heads = 4
+        while hidden_channels % _n_heads != 0:
+            _n_heads -= 1
+        self.enc_attn_query = nn.Parameter(torch.randn(1, 1, hidden_channels) * 0.02)
+        self.enc_pool_attn  = nn.MultiheadAttention(
+            hidden_channels, num_heads=_n_heads, dropout=0.0, batch_first=True
+        )
+
         # ── PRIOR NETWORK ───────────────────────────────────────────────────
-        # Learns p(z | text)
+        # Learns p(z | text, state). Uses prior_hidden_dim (default 512) for 3-layer MLP
+        # so it has enough capacity to place 10+ object-type modes in distinct regions.
+        prior_in_dim = text_emb_dim + state_dim if use_state else text_emb_dim
         self.prior_net = nn.Sequential(
-            nn.Linear(text_emb_dim, hidden_channels * 2),
+            nn.Linear(prior_in_dim, prior_hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.Linear(prior_hidden_dim, prior_hidden_dim),
+            nn.GELU(),
+            nn.Linear(prior_hidden_dim, hidden_channels),
             nn.GELU(),
         )
         self.fc_mu_p = nn.Linear(hidden_channels, latent_dim)
         self.fc_logvar_p = nn.Linear(hidden_channels, latent_dim)
 
         # ── DECODER ─────────────────────────────────────────────────────────
+        dec_in_dim = latent_dim + text_emb_dim + state_dim if use_state else latent_dim + text_emb_dim
         self.dec_input_proj = nn.Sequential(
-            nn.Linear(latent_dim + text_emb_dim, hidden_channels * chunk_size),
+            nn.Linear(dec_in_dim, hidden_channels * chunk_size),
             nn.GELU(),
         )
         self.dec_blocks = nn.ModuleList([
@@ -73,9 +92,19 @@ class TCNTextCondPriorCVAE(nn.Module):
         self.action_global_std.copy_(std.to(self.action_global_std.device))
         self._action_stats_set = True
 
-    def get_prior(self, text_emb: torch.Tensor):
-        """Compute the text-conditioned prior p(z|c)."""
-        h_p = self.prior_net(text_emb)
+    def get_prior(self, text_emb: torch.Tensor, state: torch.Tensor = None):
+        """Compute the text-conditioned prior p(z|c, s)."""
+        if self.use_state:
+            assert state is not None, "State must be provided when use_state is True"
+            B = text_emb.size(0)
+            if len(state.shape) == 1:
+                state = state.unsqueeze(0).expand(B, -1)
+            elif state.size(0) == 1 and B > 1:
+                state = state.expand(B, -1)
+            x = torch.cat([text_emb, state], dim=-1)
+        else:
+            x = text_emb
+        h_p = self.prior_net(x)
         mu_p = self.fc_mu_p(h_p)
         logvar_p = self.fc_logvar_p(h_p)
         # Bound logvar to prevent extreme values during early training
@@ -83,38 +112,54 @@ class TCNTextCondPriorCVAE(nn.Module):
         return mu_p, logvar_p
 
     def encode(self, action: torch.Tensor):
-        x = action.float().permute(0, 2, 1).contiguous()
+        x = action.float().permute(0, 2, 1).contiguous()  # (B, action_dim, T)
         h = self.enc_input_proj(x)
         for block in self.enc_blocks:
             h = block(h)
-        h = self.enc_norm(h).mean(dim=2)  # Global avg pool
-        mu_q = self.fc_mu_q(h)
-        logvar_q = self.fc_logvar_q(h)
+        h = self.enc_norm(h)                               # (B, hidden, T)
+        # Cross-attention pooling: the learned query attends over all T timesteps.
+        # Q = learned CLS token, K = V = temporal feature sequence.
+        # This is cross-attention (Q from a different source than K/V).
+        h_seq = h.permute(0, 2, 1)                         # (B, T, hidden)
+        query = self.enc_attn_query.expand(h_seq.size(0), -1, -1)   # (B, 1, hidden)
+        h_pooled, _ = self.enc_pool_attn(query, h_seq, h_seq)        # (B, 1, hidden)
+        h_pooled = h_pooled.squeeze(1)                               # (B, hidden)
+        mu_q = self.fc_mu_q(h_pooled)
+        logvar_q = self.fc_logvar_q(h_pooled)
         return mu_q, logvar_q
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
         return mu + std * torch.randn_like(mu)
 
-    def decode(self, z: torch.Tensor, text_emb: torch.Tensor):
+    def decode(self, z: torch.Tensor, text_emb: torch.Tensor, state: torch.Tensor = None):
         B = z.size(0)
         if self.training and self.dropout > 0.0 and torch.rand(1).item() < self.dropout:
             text_emb = torch.zeros_like(text_emb)
         
-        h = self.dec_input_proj(torch.cat([z, text_emb], dim=-1))
+        if self.use_state:
+            assert state is not None, "State must be provided when use_state is True"
+            if len(state.shape) == 1:
+                state = state.unsqueeze(0).expand(B, -1)
+            elif state.size(0) == 1 and B > 1:
+                state = state.expand(B, -1)
+            x = torch.cat([z, text_emb, state], dim=-1)
+        else:
+            x = torch.cat([z, text_emb], dim=-1)
+        h = self.dec_input_proj(x)
         h = h.view(B, self.hidden_channels, self.chunk_size)
         for block in self.dec_blocks:
             h = block(h)
         return self.dec_out_proj(h).permute(0, 2, 1).contiguous()
 
-    def forward(self, action: torch.Tensor, text_emb: torch.Tensor):
+    def forward(self, action: torch.Tensor, text_emb: torch.Tensor, state: torch.Tensor = None):
         mu_q, logvar_q = self.encode(action)
-        mu_p, logvar_p = self.get_prior(text_emb)
+        mu_p, logvar_p = self.get_prior(text_emb, state)
         z = self.reparameterize(mu_q, logvar_q)
-        action_recon = self.decode(z, text_emb)
+        action_recon = self.decode(z, text_emb, state)
         return action_recon, mu_q, logvar_q, mu_p, logvar_p, z
 
-    def compute_loss(self, action, action_recon, mu_q, logvar_q, mu_p, logvar_p, beta=None, recon_weight=100.0):
+    def compute_loss(self, action, action_recon, mu_q, logvar_q, mu_p, logvar_p, beta=None, recon_weight=100.0, gripper_weight=5.0):
         if beta is None:
             beta = self.beta
 
@@ -129,7 +174,7 @@ class TCNTextCondPriorCVAE(nn.Module):
                                                  reduction='none').sum(dim=1).mean()
         loss_continuous = F.mse_loss(pred_continuous, gt_continuous,
                                      reduction='none').sum(dim=(1, 2)).mean()
-        recon_loss      = (loss_continuous + 0.5 * loss_gripper) * recon_weight
+        recon_loss      = (loss_continuous + gripper_weight * loss_gripper) * recon_weight
 
         # Closed-form KL(q || p) for diagonal gaussians
         # KL = 0.5 * sum(logvar_p - logvar_q - 1 + (exp(logvar_q) + (mu_q - mu_p)^2) / exp(logvar_p))

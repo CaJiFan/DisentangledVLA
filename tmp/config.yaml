@@ -1,0 +1,5 @@
+benchmark_root: /workspace/DisentangledVLA/benchmarks/LIBERO/libero/libero
+bddl_files: /workspace/DisentangledVLA/benchmarks/LIBERO/libero/libero/bddl_files
+init_states: /workspace/DisentangledVLA/benchmarks/LIBERO/libero/libero/init_files
+datasets: /mnt/Data/cjimenez/LIBERO/libero/datasets
+assets: /workspace/DisentangledVLA/benchmarks/LIBERO/libero/libero/assets

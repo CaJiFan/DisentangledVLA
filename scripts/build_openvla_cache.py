@@ -53,6 +53,7 @@ def parse_args():
     p.add_argument("--text_backbone",  type=str, default="clip", choices=["clip", "smollm", "octo_t5", "openvla_llama"])
     p.add_argument("--embed_batch_size", type=int, default=2, help="Batch size for OpenVLA (Keep low! 7B models use immense VRAM)")
     p.add_argument("--vla_layer_idx",  type=int, default=-1, help="Which VLA layer to tap (e.g. 16 for intermediate, -1 for last)")
+    p.add_argument("--num_fusion_layers", type=int, default=1, help="Number of intermediate layers to extract. Overrides vla_layer_idx if > 1.")
     p.add_argument("--emb_cache_from", type=str, default=None, help="Reuse VLM pass if changing VAE")
     return p.parse_args()
 
@@ -88,18 +89,30 @@ def load_suite(suite: str):
 
 
 @torch.no_grad()
-def embed_openvla(vla_model, processor, images_np, instructions, batch_size=2, device=DEVICE, layer_idx=-1):
+def embed_openvla(vla_model, processor, images_np, instructions, batch_size=2, device=DEVICE, layer_idx=-1, num_fusion_layers=1):
     all_embs = []
     
-    # Locate requested transformer layer
-    target_layer = vla_model.language_model.model.layers[layer_idx]
-    captured = {}
-
-    def hook_fn(module, input, output):
-        hs = output[0] if isinstance(output, tuple) else output
-        captured['hs'] = hs.float().detach().cpu()
+    # Locate requested transformer layers
+    if num_fusion_layers > 1:
+        total_layers = len(vla_model.language_model.model.layers)
+        step = total_layers // (num_fusion_layers + 1)
+        target_indices = [step * (i + 1) - 1 for i in range(num_fusion_layers)]
+        target_layers = [vla_model.language_model.model.layers[idx] for idx in target_indices]
+        print(f"🔥 Extracting fusion layers at indices: {target_indices}")
+    else:
+        target_layers = [vla_model.language_model.model.layers[layer_idx]]
         
-    handle = target_layer.register_forward_hook(hook_fn)
+    captured = {i: None for i in range(len(target_layers))}
+    handles = []
+
+    def make_hook(i):
+        def hook_fn(module, input, output):
+            hs = output[0] if isinstance(output, tuple) else output
+            captured[i] = hs.float().detach().cpu()
+        return hook_fn
+        
+    for i, target_layer in enumerate(target_layers):
+        handles.append(target_layer.register_forward_hook(make_hook(i)))
     
     for i in tqdm.tqdm(range(0, len(images_np), batch_size), desc="OpenVLA embed"):
         batch_imgs = [Image.fromarray(img) for img in images_np[i:i+batch_size]]
@@ -115,46 +128,32 @@ def embed_openvla(vla_model, processor, images_np, instructions, batch_size=2, d
         if "pixel_values" in inputs:
             inputs = processor(text=prompts, images=batch_imgs, return_tensors="pt", padding=True).to(device, dtype=torch.bfloat16)
         
-        # When layer_idx != -1, we want to extract the full sequence of spatial tokens
-        # However, 256 tokens * 4096 dim per step is too large to cache directly.
-        # We'll rely on the projector's input_proj or we can downsample here if needed.
-        # For now, let's extract the full sequence of tokens up to the instruction length.
-        # Wait, if we extract 4096 dim * 256 tokens for 50k steps it's 100GB.
-        # Let's project it down to 256 dimensions here if layer_idx != -1.
-        
         with torch.no_grad():
             outputs = vla_model(
                 **inputs,
                 output_hidden_states=False,
                 return_dict=True
             )
-        hs = captured['hs']
-        
-        if layer_idx == -1:
+            
+        layer_embs = []
+        for j in range(len(target_layers)):
+            hs = captured[j]
             # Extract last token of the instruction (causal reasoning token)
             last_tok_idx = (inputs.attention_mask.sum(dim=1) - 1).cpu()
-            emb = hs[torch.arange(len(prompts)), last_tok_idx]
-            all_embs.append(emb)
+            emb = hs[torch.arange(len(prompts)), last_tok_idx] # [B, 4096]
+            layer_embs.append(emb)
+            captured[j] = None
+            
+        if num_fusion_layers > 1:
+            stacked_emb = torch.stack(layer_embs, dim=1) # [B, num_fusion_layers, 4096]
+            all_embs.append(stacked_emb)
         else:
-            # Extract ALL instruction and image tokens. We'll just take all non-padded tokens.
-            # `hs` is [B, seq_len, 4096]. We extract the unpadded tokens (which includes image patches)
-            # To make batching work, we'll just take the full `hs` up to the max non-padded length.
-            # Actually, since B=1 here usually, or all prompts are same length, we can just slice.
-            max_len = inputs.attention_mask.sum(dim=1).max().item()
-            seq_emb = hs[:, :max_len, :] # [B, max_len, 4096]
-            
-            # Lightweight down-projection to keep cache size sane (~15GB instead of ~250GB)
-            # We'll just pool the dimension using a fixed strided slice or linear downsample.
-            # A simple deterministic downsample: just take the first 256 dimensions, or average chunks.
-            # Averaging chunks preserves information better without needing a learned weight.
-            # 4096 / 16 = 256.
-            seq_emb = seq_emb.view(seq_emb.size(0), seq_emb.size(1), 256, 16).mean(dim=-1)
-            all_embs.append(seq_emb.cpu())
-            
-        captured.pop('hs', None)
+            all_embs.append(layer_embs[0])
+
         torch.cuda.empty_cache()
         
-    handle.remove()
+    for handle in handles:
+        handle.remove()
     return torch.cat(all_embs, dim=0)
 
 
@@ -259,7 +258,10 @@ def main():
     _cache_suffix = f"_arch_{_vae_arch}_beta{args.beta}_z{args.z_dim}"
     out_dir  = os.path.join(args.out_dir, args.suite)
     os.makedirs(out_dir, exist_ok=True)
-    _layer_suffix = f"_layer{args.vla_layer_idx}" if args.vla_layer_idx != -1 else ""
+    if args.num_fusion_layers > 1:
+        _layer_suffix = f"_fusion{args.num_fusion_layers}"
+    else:
+        _layer_suffix = f"_layer{args.vla_layer_idx}" if args.vla_layer_idx != -1 else ""
     _seed_suffix = f"_seed{args.vae_seed}"
     out_path = os.path.join(out_dir, f"vla_emb_cache_{args.vae_type}{_cache_suffix}{_seed_suffix}{_layer_suffix}.pt")
 
@@ -292,7 +294,7 @@ def main():
     # ── 2. Embeddings ───────────────────────────────────────────────────
     if args.emb_cache_from and os.path.exists(args.emb_cache_from):
         print(f"⚡ Reusing VLA/Text embeddings from {args.emb_cache_from}")
-        src = torch.load(args.emb_cache_from, map_location="cpu")
+        src = torch.load(args.emb_cache_from, map_location="cpu", weights_only=False)
         tr_emb, te_emb = src["train_emb"], src["test_emb"]
         tr_text_embs, te_text_embs = src["train_clip_emb"], src["test_clip_emb"]
     else:
@@ -311,8 +313,8 @@ def main():
 
         print(f"🧠 Generating OpenVLA embeddings from layer {args.vla_layer_idx}...")
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            tr_emb = embed_openvla(vla_model, processor, tr_imgs, tr_instrs, args.embed_batch_size, DEVICE, args.vla_layer_idx)
-            te_emb = embed_openvla(vla_model, processor, te_imgs, te_instrs, args.embed_batch_size, DEVICE, args.vla_layer_idx)
+            tr_emb = embed_openvla(vla_model, processor, tr_imgs, tr_instrs, args.embed_batch_size, DEVICE, args.vla_layer_idx, args.num_fusion_layers)
+            te_emb = embed_openvla(vla_model, processor, te_imgs, te_instrs, args.embed_batch_size, DEVICE, args.vla_layer_idx, args.num_fusion_layers)
             
             # AGGRESSIVE VRAM CLEARING BEFORE TEXT/VAE PASS
             vla_model.cpu()
@@ -340,7 +342,7 @@ def main():
             beta=args.beta, dropout=0.15, hidden_channels=64, n_blocks=N_BLOCKS, enc_text_gate_init=0.0
         ).to(DEVICE)
 
-    vae.load_state_dict(torch.load(vae_checkpoint, map_location=DEVICE))
+    vae.load_state_dict(torch.load(vae_checkpoint, map_location=DEVICE, weights_only=False))
     vae.eval()
 
     tr_mu, tr_lv = encode_teacher_vae(vae, tr_acts_norm, args.vae_type, DEVICE, text_embs=tr_text_embs)

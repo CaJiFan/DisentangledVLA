@@ -122,12 +122,38 @@ class FlowTransformerProjector(nn.Module):
         queries = queries + z_emb + t_emb
 
         # Cross-attend
-        for layer in self.layers:
-            queries = layer(queries, context)
+        for i, layer in enumerate(self.layers):
+            if context.dim() == 3 and context.size(1) == len(self.layers):
+                c_i = context[:, i:i+1, :]
+            else:
+                c_i = context
+            queries = layer(queries, c_i)
 
         # Predict vector field
         v = self.fc_out(queries).squeeze(-1)  # (B, Z_dim)
         return v
+        
+    def get_ortho_loss(self):
+        """
+        Computes the Orthogonality Regularizer loss on the latent queries.
+        Normalizes the queries and penalizes the off-diagonal elements of the Gram matrix.
+        """
+        # (Z_dim, d_model)
+        queries = self.latent_queries
+        
+        # Row-normalize to compute Cosine Similarity matrix instead of raw dot products
+        # Adding epsilon to prevent division by zero
+        queries_norm = F.normalize(queries, p=2, dim=1, eps=1e-8)
+        
+        # Compute Gram Matrix: (Z_dim, Z_dim)
+        gram = torch.matmul(queries_norm, queries_norm.transpose(0, 1))
+        
+        # Target is the Identity Matrix (orthogonal)
+        target = torch.eye(self.latent_dim, device=gram.device, dtype=gram.dtype)
+        
+        # L2 penalty (MSE) on the deviation from the Identity matrix
+        ortho_loss = F.mse_loss(gram, target)
+        return ortho_loss
 
 class _CrossAttentionBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, ffn_dim: int, dropout: float):

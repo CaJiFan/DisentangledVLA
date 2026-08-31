@@ -26,12 +26,19 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget curl vim ffmpeg \
+    git wget curl vim ffmpeg cmake build-essential \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ── 0. Upgrade Python to 3.12 ─────────────────────────────────────────────
+# PyTorch base images intentionally pin to Python 3.11 for C++ extension stability,
+# but LeRobot requires >=3.12. We upgrade via Conda before installing PyPI wheels.
+RUN conda install -y python=3.12 && \
+    python -m pip install --upgrade pip && \
+    rm -f /opt/conda/bin/cmake
 
 # ── 1. Pin torch to CUDA 12.4 BEFORE lerobot touches it ──────────────────────
 # This ensures pip's resolver considers torch already satisfied and does not
-# pull the incompatible torch+cu129 wheel that lerobot 0.4.4 would otherwise
+# pull the incompatible torch+cu129 wheel that lerobot would otherwise
 # request.  Force-reinstall guarantees the cu124 build wins even if pytorch
 # base image ships a slightly different minor version.
 RUN pip install --force-reinstall \
@@ -54,10 +61,11 @@ RUN pip install \
     wandb \
     clip@git+https://github.com/openai/CLIP.git
 
-# ── 3. LeRobot + SmolVLA ──────────────────────────────────────────────────────
+# ── 3. LeRobot (SmolVLA + Pi0) ────────────────────────────────────────────────
 # --extra-index-url ensures pip can still find cu124 torch wheels if any
 # lerobot transitive dep tries to re-resolve torch.
-RUN pip install "lerobot[smolvla]" \
+# Installing from GitHub main ensures we get the latest Pi0 and SmolVLA configs!
+RUN pip install "lerobot[smolvla,pi0]@git+https://github.com/huggingface/lerobot.git" \
     --extra-index-url https://download.pytorch.org/whl/cu124
 
 # ── 4. If torch got upgraded by lerobot, pin it back ─────────────────────────
@@ -67,7 +75,8 @@ RUN pip install --force-reinstall \
     "torchvision" \
     --index-url https://download.pytorch.org/whl/cu124
 
-RUN pip install robosuite==1.4.0 easydict egl_probe gym
+RUN rm -f /opt/conda/bin/cmake && \
+    pip install robosuite==1.4.0 easydict egl_probe gym
 
 WORKDIR /workspace/DisentangledVLA
 

@@ -100,7 +100,7 @@ class ConvTextActionBetaTCVAE(nn.Module):
         action_recon = self.decode(z, text_emb)
         return action_recon, mu, logvar, z
 
-    def compute_loss(self, action, action_recon, mu, logvar, z, beta=6.0, alpha=1.0, recon_weight=50, vel_weight=0.0):
+    def compute_loss(self, action, action_recon, mu, logvar, z, beta=6.0, alpha=1.0, recon_weight=50, vel_weight=0.0, gripper_weight=5.0):
         batch_size, latent_dim = z.shape
 
         pred_continuous = action_recon[..., :6]
@@ -126,7 +126,7 @@ class ConvTextActionBetaTCVAE(nn.Module):
         # Sum across time (dim 1) and action features (dim 2), then mean across batch (dim 0)
         loss_continuous = loss_continuous.sum(dim=(1, 2)).mean()
 
-        recon_loss = (loss_continuous + (0.5 * loss_gripper)) * recon_weight
+        recon_loss = (loss_continuous + (gripper_weight * loss_gripper)) * recon_weight
         
         mu_expand = mu.unsqueeze(0)           
         logvar_expand = logvar.unsqueeze(0)   
@@ -462,6 +462,17 @@ class TCNTextActionBetaTCVAE(nn.Module):
         self.fc_mu     = nn.Linear(hidden_channels, latent_dim)
         self.fc_logvar = nn.Linear(hidden_channels, latent_dim)
 
+        # Attention pooling: replaces global avg pool in the encoder.
+        # A single learned CLS-like query cross-attends over all T timestep features
+        # so the encoder learns which timesteps carry the most information for z.
+        _n_heads = 4
+        while hidden_channels % _n_heads != 0:
+            _n_heads -= 1
+        self.enc_attn_query = nn.Parameter(torch.randn(1, 1, hidden_channels) * 0.02)
+        self.enc_pool_attn  = nn.MultiheadAttention(
+            hidden_channels, num_heads=_n_heads, dropout=0.0, batch_first=True
+        )
+
         # ── DECODER ─────────────────────────────────────────────────────────
         self.dec_input_proj = nn.Sequential(
             nn.Linear(latent_dim + text_emb_dim, hidden_channels * chunk_size),
@@ -488,8 +499,13 @@ class TCNTextActionBetaTCVAE(nn.Module):
         h = self.enc_input_proj(x)
         for block in self.enc_blocks:
             h = block(h)
-        h = self.enc_norm(h).mean(dim=2)                   # global avg pool → (B, hidden)
-        return self.fc_mu(h), self.fc_logvar(h)
+        h = self.enc_norm(h)                               # (B, hidden, T)
+        # Cross-attention pooling: learned CLS query over temporal axis
+        h_seq = h.permute(0, 2, 1)                         # (B, T, hidden)
+        query = self.enc_attn_query.expand(h_seq.size(0), -1, -1)   # (B, 1, hidden)
+        h_pooled, _ = self.enc_pool_attn(query, h_seq, h_seq)        # (B, 1, hidden)
+        h_pooled = h_pooled.squeeze(1)                               # (B, hidden)
+        return self.fc_mu(h_pooled), self.fc_logvar(h_pooled)
 
     def decode(self, z: torch.Tensor, text_emb: torch.Tensor):
         B = z.size(0)
@@ -680,6 +696,15 @@ class TCNTextActionCVAE(nn.Module):
         self.fc_mu     = nn.Linear(hidden_channels, latent_dim)
         self.fc_logvar = nn.Linear(hidden_channels, latent_dim)
 
+        # Attention pooling: replaces global avg pool before text fusion.
+        _n_heads = 4
+        while hidden_channels % _n_heads != 0:
+            _n_heads -= 1
+        self.enc_attn_query = nn.Parameter(torch.randn(1, 1, hidden_channels) * 0.02)
+        self.enc_pool_attn  = nn.MultiheadAttention(
+            hidden_channels, num_heads=_n_heads, dropout=0.0, batch_first=True
+        )
+
         # ── DECODER ─────────────────────────────────────────────────────────
         self.dec_input_proj = nn.Sequential(
             nn.Linear(latent_dim + text_emb_dim, hidden_channels * chunk_size),
@@ -707,7 +732,12 @@ class TCNTextActionCVAE(nn.Module):
         h = self.enc_input_proj(x)
         for block in self.enc_blocks:
             h = block(h)
-        h = self.enc_norm(h).mean(dim=2)                   # global avg pool → (B, hidden)
+        h = self.enc_norm(h)                               # (B, hidden, T)
+        # Cross-attention pooling over temporal axis
+        h_seq = h.permute(0, 2, 1)                         # (B, T, hidden)
+        query = self.enc_attn_query.expand(h_seq.size(0), -1, -1)   # (B, 1, hidden)
+        h_pooled, _ = self.enc_pool_attn(query, h_seq, h_seq)        # (B, 1, hidden)
+        h = h_pooled.squeeze(1)                                      # (B, hidden)
 
         # Classifier-free guidance dropout: randomly zero text in encoder during training.
         if self.training and self.dropout > 0.0 and torch.rand(1).item() < self.dropout:

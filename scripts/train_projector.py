@@ -15,11 +15,10 @@ import wandb
 import gc
 
 # --- Imports from your codebase ---
-from transformers import AutoModelForVision2Seq, AutoProcessor
+# from transformers import AutoModelForVision2Seq, AutoProcessor
 
 from src.projectors import ProbabilisticActionProjector, MLPActionProjector, KLTransformerProjector, FlowTransformerProjector
-from utils.data import get_vla_projector_dataloader_cached, log_projector_video_probe, log_gt_video_probe, log_octo_gt_video_probe
-from utils.octo_worker import OctoWorker
+from utils.data import get_vla_projector_dataloader_cached, log_projector_video_probe, log_gt_video_probe, _make_openvla_emb_fn, _make_pi0_emb_fn
 from torch.utils.data import ConcatDataset, DataLoader as TorchDataLoader
 from utils.losses import KLDistillationLoss, ClosedFormW2Loss
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -73,16 +72,18 @@ def parse_args():
     parser.add_argument("--vae_type", type=str, default="text_cond_beta_tcvae",
                         choices=["text_cond_beta_tcvae", "text_cvae", "cond_prior"])
 
+    parser.add_argument("--use_state_cond", action="store_true", default=False,
+                        help="Condition the VAE prior and decoder on robot proprioceptive state (position, quat, gripper).")
     # Loss Types
     parser.add_argument("--loss", type=str, default="kl", choices=["mse", "nll", "w2", "kl", "flow"], help="Loss function to use. 'kl' (recommended) distills the full teacher posterior (mu+logvar). 'nll' only fits mu. 'w2' collapses logvar to zero. 'flow' trains a Continuous Normalizing Flow via CFM.")
 
     # Checkpoints
-    parser.add_argument("--vla_type", type=str, default="openvla", choices=["openvla", "octo", "smolvla"],
+    parser.add_argument("--vla_type", type=str, default="openvla", choices=["openvla", "smolvla", "pi0"],
                         help="Which VLA the embedding cache was built from. Controls cache and save paths.")
-    parser.add_argument("--octo_model", type=str, default="hf://rail-berkeley/octo-small-1.5",
-                        help="Octo model path (HuggingFace or local). Used only for video probes when --vla_type octo.")
     parser.add_argument("--smolvla_model", type=str, default="lerobot/smolvla_base",
                         help="SmolVLA checkpoint (HuggingFace or local). Used only if video probes are added for smolvla.")
+    parser.add_argument("--pi0_model", type=str, default="lerobot/pi0",
+                        help="Pi0 checkpoint (HuggingFace or local). Used only if video probes are added for pi0.")
     parser.add_argument("--vla_checkpoint", type=str, default="openvla/openvla-7b")
     parser.add_argument("--vla_out_dim", type=int, default=4096,
                         help="VLA last-hidden-state dimension. Used to avoid loading the VLA "
@@ -95,7 +96,15 @@ def parse_args():
     # Training Hyperparams
     parser.add_argument("--batch_size", type=int, default=256)  # TensorDataset — no VLA bottleneck
     parser.add_argument("--max_steps", type=int, default=200_000)
+    parser.add_argument("--lr_decay_steps", type=int, default=None,
+                        help="Number of steps to decay learning rate over. Defaults to max_steps if not provided.")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr_eta_min", type=float, default=1e-6,
+                        help="Minimum learning rate to decay to.")
+    parser.add_argument("--patience", type=int, default=15,
+                        help="If >0, enables early stopping with this patience window in terms of validation evaluations.")
+    parser.add_argument("--eval_every", type=int, default=10000,
+                        help="Number of training steps between validation evaluations.")
     parser.add_argument("--auto_resume", type=int, default=1, help="If 1, auto-resume from latest checkpoint for this config")
     parser.add_argument("--resume_step", type=int, default=0, help="Manual override to resume from specific step")
     parser.add_argument("--suite", type=str, required=True,
@@ -130,10 +139,13 @@ def parse_args():
                              "MSE(vae.decode(pred_mu, text_emb), gt_actions). "
                              "Gives direct action-space gradient signal. Start with 0.1.")
     parser.add_argument("--text_backbone", type=str, default="smollm",
-                        choices=["clip", "smollm", "octo_t5", "openvla_llama"],
+                        choices=["clip", "smollm", "openvla_llama"],
                         help="Which language model tokenizer was used for the baseline VAE.")
     parser.add_argument("--vla_layer_idx", type=int, default=-1, 
-                        help="Which VLA layer to tap (e.g. 16 for intermediate, -1 for last)")
+                        help="Which OpenVLA layer to extract (e.g. 16 for intermediate, -1 for last)")
+    parser.add_argument("--num_fusion_layers", type=int, default=1, help="Number of intermediate layers to extract. Overrides vla_layer_idx if > 1.")
+    parser.add_argument("--ortho_weight", type=float, default=0.0,
+                        help="Weight for the orthogonality regularizer on the Flow Matcher's latent queries. Set to >0 (e.g. 0.01) to enable.")
     
     # WandB
     parser.add_argument("--use_wandb", action="store_true", default=True)
@@ -177,6 +189,7 @@ def get_vla_embedding(model, processor, images, instructions, use_vision_pool=Fa
 
 def load_openvla_model(model_path):
     print(f"🏗️  Loading OpenVLA from {model_path} in bfloat16...")
+    from transformers import AutoModelForVision2Seq, AutoProcessor
     model = AutoModelForVision2Seq.from_pretrained(
         model_path, 
         torch_dtype=torch.bfloat16, 
@@ -193,12 +206,13 @@ def load_openvla_model(model_path):
 CHUNK_SIZE = 8
 ACTION_DIM = 7
 N_BLOCKS = max(3, (CHUNK_SIZE - 1).bit_length())  # RF covers chunk_size
-TEST_STEPS = 10_000
 VAE_DROPOUT = 0.15
 
 # Probe tasks (must exist in LIBERO HDF5 dir)
 PROBE_VAL_TASK   = "pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate_demo"
 PROBE_TRAIN_TASK = "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo"
+PROBE_EXTRA_TASK_1 = "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo"
+PROBE_EXTRA_TASK_2 = "pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate_demo"
 
 @torch.no_grad()
 def sample_flow(projector, vla_embedding, z_dim, num_steps=10):
@@ -216,9 +230,25 @@ def train_projector():
     seed_everything(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Dynamically assign probe tasks for the active suite
+    if args.suite == "libero_object":
+        PROBE_VAL_TASK = "pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo"
+        PROBE_TRAIN_TASK = "pick_up_the_cream_cheese_and_place_it_in_the_basket_demo"
+        PROBE_EXTRA_TASK_1 = "pick_up_the_salad_dressing_and_place_it_in_the_basket_demo"
+        PROBE_EXTRA_TASK_2 = "pick_up_the_bbq_sauce_and_place_it_in_the_basket_demo"
+    elif args.suite == "libero_goal":
+        PROBE_VAL_TASK = "open_the_middle_drawer_of_the_cabinet_demo"
+        PROBE_TRAIN_TASK = "put_the_bowl_on_the_plate_demo"
+        PROBE_EXTRA_TASK_1 = "push_the_plate_to_the_front_of_the_stove_demo"
+        PROBE_EXTRA_TASK_2 = "put_the_cream_cheese_in_the_bowl_demo"
+    else:
+        PROBE_VAL_TASK = "pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate_demo"
+        PROBE_TRAIN_TASK = "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo"
+        PROBE_EXTRA_TASK_1 = "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo"
+        PROBE_EXTRA_TASK_2 = "pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate_demo"
+
     text_embed_dim_dict = {
         'smollm': 960,
-        'octo_t5': 768,
         'openvla_llama': 4096,
         'clip': 512,
     }
@@ -231,40 +261,37 @@ def train_projector():
     
     # Dynamically extract beta from the checkpoint name so caches are named correctly!
     import re
-    _beta_match = re.search(r'_beta([0-9.]+)_', args.vae_checkpoint)
-    BETA = float(_beta_match.group(1)) if _beta_match else 0.001
+    _beta_match = re.search(r'_beta([0-9.\-]+)_', args.vae_checkpoint)
+    BETA = _beta_match.group(1) if _beta_match else "0.1"
+
+    # State-conditioned VAEs require live robot proprioception (not present in offline embedding cache).
+    if args.action_recon_weight > 0.0 and args.use_state_cond:
+        print("⚠️  --action_recon_weight > 0 is not supported with state-conditioned VAEs (offline cache stores pure latents). Forcing action_recon_weight=0.0.")
+        args.action_recon_weight = 0.0
 
     # Determine protocol
     _protocol_tag = "protA" if args.train_split_ratio is None else f"protB_split{args.train_split_ratio}"
 
     _layer_tag = f"_layer{args.vla_layer_idx}" if args.vla_layer_idx != -1 else ""
-    run_name = f"{args.vla_type}_{args.suite}_proj_{args.projector_type}_{args.vae_type}_text_{args.text_backbone}_{args.projector_arch}_{_vae_arch}_loss_{args.loss}_arwd{args.action_recon_weight}_beta{BETA}_z{Z_DIM}_{_protocol_tag}{_layer_tag}"
-
-    if args.normalize_emb:
-        run_name += "_normemb"
+    run_name = f"{args.vla_type}_{args.suite}_{args.projector_arch}_fusion{args.num_fusion_layers}_loss_{args.loss}_arw{args.action_recon_weight}_ortho{args.ortho_weight}_z{Z_DIM}_{_protocol_tag}{_layer_tag}"
 
     if args.use_vision_pool:
         run_name += "_vpool"
 
-    run_name += "_gripfix"
-
     if args.use_wandb:
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
-    if args.vla_type == "octo":
+    if args.vla_type == "openvla":
         args.max_steps *= 2.5
-        if args.vla_layer_idx != -1:
-            print(f"⚠️  WARNING: --vla_layer_idx {args.vla_layer_idx} passed, but Octo only supports final layer extraction. Forcing --vla_layer_idx=-1.")
-            args.vla_layer_idx = -1
-    elif args.vla_type == "openvla":
-        args.max_steps *= 2.5
+        if args.lr_decay_steps is not None:
+            args.lr_decay_steps *= 2.5
     elif args.vla_type == "smolvla":
         args.max_steps *= 2.5
+        if args.lr_decay_steps is not None:
+            args.lr_decay_steps *= 2.5
         if args.vla_layer_idx != -1:
             print(f"⚠️  WARNING: --vla_layer_idx {args.vla_layer_idx} passed, but SmolVLA only supports final layer extraction. Forcing --vla_layer_idx=-1.")
             args.vla_layer_idx = -1
-
-    run_name += f"_seed_{args.seed}"
 
     # --- 1. LOAD MODELS ---
     print(f"Loading Frozen Teacher VAE ({args.vae_type})...")
@@ -301,9 +328,14 @@ def train_projector():
             dropout=VAE_DROPOUT,
             hidden_channels=64,
             n_blocks=N_BLOCKS,
+            use_state=args.use_state_cond,
         ).to(DEVICE)
 
-    vae.load_state_dict(torch.load(args.vae_checkpoint))
+    ckpt_data = torch.load(args.vae_checkpoint, map_location=DEVICE, weights_only=False)
+    if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
+        vae.load_state_dict(ckpt_data["model_state_dict"])
+    else:
+        vae.load_state_dict(ckpt_data)
     vae.eval() 
     for param in vae.parameters(): param.requires_grad = False
 
@@ -314,7 +346,8 @@ def train_projector():
     # Octo and SmolVLA caches include VAE-arch/beta/z in the filename to distinguish
     # caches built for different VAE types without re-running the expensive VLM pass.
     _vae_arch = {"text_cond_beta_tcvae": "tcn", "text_cvae": "cvae", "cond_prior": "cond_prior"}.get(args.vae_type, "")
-    _cache_name = f"vla_emb_cache_{args.vae_type}_arch_{_vae_arch}_beta{BETA}_z{Z_DIM}"
+    _prefix = "pi0_emb_cache" if args.vla_type == "pi0" else "vla_emb_cache"
+    _cache_name = f"{_prefix}_{args.vae_type}_arch_{_vae_arch}_beta{BETA}_z{Z_DIM}"
     if args.text_backbone != "clip": _cache_name += f"_text_{args.text_backbone}"
     _vpool_suffix = "_vpool" if getattr(args, "use_vision_pool", False) else ""
     _cache_name += _vpool_suffix
@@ -322,61 +355,65 @@ def train_projector():
     _vae_seed_match = re.search(r'_seed_(\d+)', args.vae_checkpoint)
     _vae_seed = int(_vae_seed_match.group(1)) if _vae_seed_match else 1
     _cache_name += f"_seed{_vae_seed}"
-    if args.vla_layer_idx != -1: _cache_name += f"_layer{args.vla_layer_idx}"
+    if args.num_fusion_layers > 1:
+        _cache_name += f"_fusion{args.num_fusion_layers}"
+    elif args.vla_layer_idx != -1: 
+        _cache_name += f"_layer{args.vla_layer_idx}"
     _cache_name += ".pt"
 
     # For OpenVLA: if the target cache doesn't exist, look for any other VAE-type cache
     # that has saved actions. If found, we can reteach teacher targets (~1 min VAE encode)
     # instead of re-running the full 14 GB VLA embedding extraction pass.
-    # For Octo: same logic — scan the suite dir for any cache with actions so we don't
-    # crash (vla_model=None for octo; re-extraction is impossible without build_octo_cache.py).
+    # Same logic applies for smolvla.
     _ALT_VAE_TYPES = {"text_cond_beta_tcvae": "text_cvae", "text_cvae": "text_cond_beta_tcvae"}
     _alt_cache_name = f"vla_emb_cache_{_ALT_VAE_TYPES.get(args.vae_type, '')}{_vpool_suffix}.pt" \
         if args.vla_type == "openvla" else None
 
     def _find_fallback(suite_name):
         """Return path to an alternate cache with saved actions, or None.
-        For openvla: checks the known alternate VAE-type cache name.
-        For octo: scans the suite dir for any vla_emb_cache_*.pt with actions."""
-        suite_dir = f"{_cache_root}/{suite_name}"
-        suite_dir = f"{_cache_root}/{suite_name}"
-        if not os.path.isdir(suite_dir):
-            return None
+        For openvla: checks the known alternate VAE-type cache name."""
+        suite_dirs = [f"{_cache_root}/{suite_name}", f"{_cache_root}/{suite_name}_no_noops"]
         target = _cache_name
         layer_suffix = f"_layer{args.vla_layer_idx}" if args.vla_layer_idx != -1 else ""
         seed_suffix = f"_seed{_vae_seed}"
-        candidates = [
-            os.path.join(suite_dir, f)
-            for f in os.listdir(suite_dir)
-            if f.startswith("vla_emb_cache_") and f.endswith(f"{layer_suffix}.pt") and f != target
-            and (args.vla_layer_idx != -1 or "_layer" not in f)
-        ]
-        for p in candidates:
-            try:
-                c = torch.load(p, map_location="cpu")
-                if "train_actions" in c:
-                    # Enforce Protocol isolation (don't mix protA and protB caches!)
-                    has_test_split = len(c.get("test_emb", [])) > 0
-                    if args.train_split_ratio is None and has_test_split:
-                        continue # Skip protB cache when running protA
-                    if args.train_split_ratio is not None and not has_test_split:
-                        continue # Skip protA cache when running protB
-                        
-                    return p
-            except Exception:
+        for suite_dir in suite_dirs:
+            if not os.path.isdir(suite_dir):
                 continue
+            candidates = [
+                os.path.join(suite_dir, f)
+                for f in os.listdir(suite_dir)
+                if (f.startswith("vla_emb_cache_") or f.startswith("pi0_emb_cache_")) 
+                and (f.endswith(f"{layer_suffix}.pt") or "fusion" in f) and f != target
+                and (args.vla_layer_idx != -1 or "_layer" not in f)
+            ]
+            for p in candidates:
+                try:
+                    c = torch.load(p, map_location="cpu", weights_only=False)
+                    if "train_actions" in c or "train_emb" in c:
+                        # Enforce Protocol isolation (don't mix protA and protB caches!)
+                        has_test_split = len(c.get("test_emb", [])) > 0
+                        if args.train_split_ratio is None and has_test_split:
+                            continue # Skip protB cache when running protA
+                        if args.train_split_ratio is not None and not has_test_split:
+                            continue # Skip protA cache when running protB
+                            
+                        return p
+                except Exception:
+                    continue
         return None
 
     if args.suite == "libero_all":
         cache_path   = None  # per-suite paths used in the multi-suite loop below
         cache_exists = all(
-            os.path.exists(f"{_cache_root}/{s}/{_cache_name}")
+            os.path.exists(f"{_cache_root}/{s}/{_cache_name}") or os.path.exists(f"{_cache_root}/{s}_no_noops/{_cache_name}")
             for s in _ALL_SUITES
         )
         _fallback_paths = {s: _find_fallback(s) for s in _ALL_SUITES} if not cache_exists else {}
         fallback_exists = all(_fallback_paths.get(s) for s in _ALL_SUITES)
     else:
         cache_path   = f"{_cache_root}/{args.suite}/{_cache_name}"
+        if not os.path.exists(cache_path) and os.path.exists(f"{_cache_root}/{args.suite}_no_noops/{_cache_name}"):
+            cache_path = f"{_cache_root}/{args.suite}_no_noops/{_cache_name}"
         cache_exists = os.path.exists(cache_path)
         _fallback_path = _find_fallback(args.suite) if not cache_exists else None
         fallback_exists = _fallback_path is not None
@@ -391,14 +428,23 @@ def train_projector():
         _probe_path = cache_path if (cache_path and os.path.exists(str(cache_path))) else \
             (_fallback_path if args.suite != "libero_all" else _fallback_paths.get("libero_spatial")) or \
             f"{_cache_root}/libero_spatial/{_cache_name}"
+        DEFAULT_VLA_DIMS = {"openvla": 4096, "pi0": 2048, "octo": 768, "smolvla": 960}
+        default_dim = DEFAULT_VLA_DIMS.get(args.vla_type, args.vla_out_dim)
         if _probe_path and os.path.exists(_probe_path):
-            _probe = torch.load(_probe_path, map_location="cpu")
-            VLA_OUT_DIM = int(_probe.get("octo_dim",
-                             _probe["train_emb"].shape[-1] if "train_emb" in _probe
-                             else args.vla_out_dim))
+            _probe = torch.load(_probe_path, map_location="cpu", weights_only=False)
+            if "train_emb" in _probe:
+                VLA_OUT_DIM = int(_probe["train_emb"].shape[-1])
+            elif "octo_dim" in _probe:
+                VLA_OUT_DIM = int(_probe["octo_dim"])
+            else:
+                first_k = next(iter(_probe.keys()), None)
+                if first_k and isinstance(_probe[first_k], dict) and "train_emb" in _probe[first_k]:
+                    VLA_OUT_DIM = int(_probe[first_k]["train_emb"].shape[-1])
+                else:
+                    VLA_OUT_DIM = default_dim
             del _probe
         else:
-            VLA_OUT_DIM = args.vla_out_dim
+            VLA_OUT_DIM = default_dim
     else:
         if args.vla_type != "openvla":
             raise ValueError(f"Target embedding cache not found at {cache_path} and no fallback cache was found.\n"
@@ -411,7 +457,7 @@ def train_projector():
         elif hasattr(vla_model.config, "text_config"):
             VLA_OUT_DIM = vla_model.config.text_config.hidden_size
         else:
-            VLA_OUT_DIM = args.vla_out_dim
+            VLA_OUT_DIM = DEFAULT_VLA_DIMS.get(args.vla_type, args.vla_out_dim)
     print(f"📐 VLA Embedding Dimension: {VLA_OUT_DIM}")
 
     print(f"Initializing Student Projector ({args.projector_type})...")
@@ -450,31 +496,38 @@ def train_projector():
             w2_criterion = ClosedFormW2Loss().to(DEVICE)
 
     optimizer = optim.AdamW(projector.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.max_steps, last_epoch=-1)
+    decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else args.max_steps
+    scheduler = CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=args.lr_eta_min, last_epoch=-1)
 
     # ---------------------------------------------------------
     # Checkpoint Auto-Resume Logic
     # ---------------------------------------------------------
     base_dir = f"{args.save_dir}/{args.vla_type}/{args.suite}/chunk_{CHUNK_SIZE}_zdim_{Z_DIM}"
+    ckpt_prefix = f"{args.projector_type}_{args.projector_arch}_fusion{args.num_fusion_layers}_ortho{args.ortho_weight}_loss_{args.loss}_seed_{args.seed}"
     if args.auto_resume:
         if os.path.exists(base_dir):
-            prefix = f"{args.projector_type}_{args.projector_arch}_loss_{args.loss}_seed_{args.seed}_step_"
+            prefix = f"{ckpt_prefix}_step_"
             ckpts = [f for f in os.listdir(base_dir) if f.startswith(prefix) and f.endswith(".pt")]
             if ckpts:
                 latest_step = max([int(f.replace(prefix, "").replace(".pt", "")) for f in ckpts])
                 args.resume_step = latest_step
 
+    best_val_loss = float("inf")
+    patience_counter = 0
+
     if args.resume_step > 0:
-        ckpt = f"{base_dir}/{args.projector_type}_{args.projector_arch}_loss_{args.loss}_seed_{args.seed}_step_{args.resume_step}.pt"
+        ckpt = f"{base_dir}/{ckpt_prefix}_step_{args.resume_step}.pt"
         if os.path.exists(ckpt):
             print(f"🔄 Resuming from {ckpt}")
-            checkpoint = torch.load(ckpt, map_location=DEVICE)
+            checkpoint = torch.load(ckpt, map_location=DEVICE, weights_only=False)
             if "model_state_dict" in checkpoint:
                 projector.load_state_dict(checkpoint["model_state_dict"])
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
                 args.resume_step = checkpoint["step"]
-                print(f"✅ Full state restored from step {args.resume_step} (Model + Optimizer + Scheduler)")
+                best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+                patience_counter = checkpoint.get("patience_counter", 0)
+                print(f"✅ Full state restored from step {args.resume_step} (Model + Optimizer + Scheduler) | Best Val Loss: {best_val_loss:.6f}")
             else:
                 # Legacy checkpoint that only saved model weights
                 projector.load_state_dict(checkpoint)
@@ -498,6 +551,7 @@ def train_projector():
                 cache_path=_cp, fallback_cache_path=_fb, device=DEVICE, vae=vae, vae_type=args.vae_type,
                 use_vision_pool=args.use_vision_pool, text_backbone=args.text_backbone,
                 train_split_ratio=args.train_split_ratio, vla_layer_idx=args.vla_layer_idx,
+                num_fusion_layers=args.num_fusion_layers,
             )
             train_sub.append(_tr_dl.dataset)
             if _te_dl is not None:
@@ -521,6 +575,7 @@ def train_projector():
             use_vision_pool=args.use_vision_pool,
             train_split_ratio=args.train_split_ratio,
             vla_layer_idx=args.vla_layer_idx,
+            num_fusion_layers=args.num_fusion_layers,
         )
 
 
@@ -542,23 +597,8 @@ def train_projector():
     _stats_suite = "libero_spatial" if args.suite == "libero_all" else args.suite
     stats_path = f"./checkpoints/text_tcvae/{_stats_suite}/dataset_statistics.pt"
 
-    # For Octo runs, start the persistent Octo subprocess for video probes.
-    # It lives in a separate process so JAX and PyTorch don't share a CUDA context.
-    octo_worker    = None
-    octo_emb_fn    = None
     smolvla_policy = None
-    if args.vla_type == "octo" and args.use_wandb:
-        print("🤖 Starting Octo worker subprocess for video probes…")
-        octo_worker = OctoWorker(
-            octo_model_path=getattr(args, "octo_model", "hf://rail-berkeley/octo-small-1.5"),
-            use_cpu=True,
-            libero_stats_path=stats_path,
-            libero_suite_key=f"{_stats_suite}_no_noops",
-        )
-        octo_worker.start()
-        octo_emb_fn = octo_worker.make_emb_fn()
-        octo_gt_fn  = octo_worker.make_gt_fn()
-    elif args.vla_type == "smolvla" and args.use_wandb:
+    if args.vla_type == "smolvla" and args.use_wandb:
         # SmolVLA is PyTorch — no subprocess needed.
         # Load once onto CPU; moved to GPU only for each video probe interval.
         # lerobot may not be installed in every container (e.g. openvla_worker);
@@ -574,12 +614,29 @@ def train_projector():
         except ImportError:
             print("⚠️  lerobot not found — SmolVLA video probes will be skipped (training unaffected).")
 
+    pi0_policy = None
+    pi0_tokenizer = None
+    if args.vla_type == "pi0" and args.use_wandb:
+        try:
+            from lerobot.policies.pi0.modeling_pi0 import PI0Policy
+            from transformers import AutoTokenizer
+            print(f"🤖 Loading Pi0 for video probes from {args.pi0_model} …")
+            pi0_policy = PI0Policy.from_pretrained(args.pi0_model).cpu().eval()
+            for _p in pi0_policy.parameters():
+                _p.requires_grad_(False)
+            pi0_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+            print("✅ Pi0 loaded (on CPU, will move to GPU per probe).")
+        except Exception as e:
+            print(f"⚠️  Failed to load Pi0 policy/tokenizer for video probes: {e} — Pi0 video probes will be skipped.")
+
     def infinite_loader(dl):
         while True:
             for batch in dl:
                 yield batch
 
     data_iter = infinite_loader(train_dataloader)
+
+    running_train_action_mses = []
 
     # Training loop
     print(f"🚀 Starting Training from step {args.resume_step} to {args.max_steps}...")
@@ -591,6 +648,10 @@ def train_projector():
                            device=DEVICE, probe_task_name=PROBE_VAL_TASK, split_name="val")
         log_gt_video_probe(step=0, suite_name=_stats_suite, stats_path=stats_path,
                            device=DEVICE, probe_task_name=PROBE_TRAIN_TASK, split_name="train")
+        log_gt_video_probe(step=0, suite_name=_stats_suite, stats_path=stats_path,
+                           device=DEVICE, probe_task_name=PROBE_EXTRA_TASK_1, split_name="val_extra1")
+        log_gt_video_probe(step=0, suite_name=_stats_suite, stats_path=stats_path,
+                           device=DEVICE, probe_task_name=PROBE_EXTRA_TASK_2, split_name="val_extra2")
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -606,6 +667,7 @@ def train_projector():
                 accum_pred_logvar = 0.0  # tracks projector pred_logvar
                 accum_cos_sim = 0.0
                 accum_recon_loss = 0.0   # action-space reconstruction loss (pred_mu)
+                accum_ortho_loss = 0.0
 
                 for _ in range(args.accum_steps):
                     vla_embedding, target_mu, target_logvar, text_emb, gt_actions = next(data_iter)
@@ -641,6 +703,13 @@ def train_projector():
                             v_target = z_1 - z_0
                             pred_v = projector(vla_embedding, z_t, t)
                             loss = F.mse_loss(pred_v, v_target) / args.accum_steps
+                            
+                            ortho_loss_val = 0.0
+                            if args.ortho_weight > 0.0:
+                                o_loss = projector.get_ortho_loss()
+                                loss = loss + (args.ortho_weight * o_loss) / args.accum_steps
+                                ortho_loss_val = o_loss.item()
+                            accum_ortho_loss += ortho_loss_val / args.accum_steps
                             
                             if args.action_recon_weight > 0.0:
                                 z_for_recon = sample_flow(projector, vla_embedding, Z_DIM, num_steps=10)
@@ -681,9 +750,13 @@ def train_projector():
                 # --- D. OPTIMIZER STEP (once per effective batch) ---
                 torch.nn.utils.clip_grad_norm_(projector.parameters(), max_norm=1.0)
                 optimizer.step()
-                scheduler.step()
+                if steps < decay_steps:
+                    scheduler.step()
                 steps += 1
-                current_lr = scheduler.get_last_lr()[0]
+                if args.action_recon_weight > 0.0:
+                    running_train_action_mses.append(accum_recon_loss)
+                    running_train_action_mses = running_train_action_mses[-1000:]
+                current_lr = optimizer.param_groups[0]["lr"]
 
                 # --- E. TRAINING LOGGING ---
                 if args.projector_type == "mlp":
@@ -701,17 +774,20 @@ def train_projector():
                                 "global_step": steps}
                         if args.action_recon_weight > 0.0:
                             log_entry["train/action_recon_loss"] = accum_recon_loss
+                        if args.ortho_weight > 0.0:
+                            log_entry["train/ortho_loss"] = accum_ortho_loss
                         wandb.log(log_entry, step=steps)
 
                 pbar.update(1)
                 if steps % 1000 == 0: gc.collect()
 
                 # --- F. EVAL LOOP + VIDEO PROBE ---
-                if steps % TEST_STEPS == 0:
+                if steps % args.eval_every == 0:
                     projector.eval()
 
+                    early_stop = False
+                    val_loss = None
                     if test_dataloader is not None:
-                        # Protocol B: evaluate on held-out test tasks.
                         test_losses, test_mse_mus, test_logvars, test_teacher_logvars = [], [], [], []
                         test_action_mses, test_z_mean_norms = [], []
 
@@ -751,8 +827,10 @@ def train_projector():
                                     test_action_mses.append(action_recon_loss(pred_actions_recon, _t_actions).item())
                                     test_z_mean_norms.append(p_mu.norm(dim=-1).mean().item())
 
+                        val_loss = sum(test_losses) / len(test_losses)
+
                         if args.use_wandb:
-                            log_dict = {"test/loss_kl": sum(test_losses) / len(test_losses),
+                            log_dict = {"test/loss": val_loss,
                                         "global_step": steps}
                             if test_mse_mus:
                                 log_dict["test/mse_mu"]        = sum(test_mse_mus)        / len(test_mse_mus)
@@ -761,82 +839,92 @@ def train_projector():
                                 log_dict["test/action_mse"]    = sum(test_action_mses)     / len(test_action_mses)
                                 log_dict["test/z_pred_norm"]   = sum(test_z_mean_norms)    / len(test_z_mean_norms)
                             wandb.log(log_dict, step=steps)
-                    # Protocol A: no test dataloader — skip eval loop.
-                    # Convergence is monitored via train/* metrics; evaluation via simulator.
+
+                    else:
+                        # Protocol A: calculate running average of training action_mse
+                        if len(running_train_action_mses) > 0:
+                            val_loss = sum(running_train_action_mses) / len(running_train_action_mses)
+                            print(f"📈 Step {steps} — Running average training action_mse (last 1000 steps): {val_loss:.6f}")
+                            if args.use_wandb:
+                                wandb.log({"train/running_action_mse": val_loss, "global_step": steps}, step=steps)
+
+                    if val_loss is not None:
+                        # Early Stopping & Best Model Saving Logic
+                        base_dir = f"{args.save_dir}/{args.vla_type}/{args.suite}/chunk_{CHUNK_SIZE}_zdim_{Z_DIM}"
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            patience_counter = 0
+                            best_path = f"{base_dir}/{ckpt_prefix}_best.pt"
+                            os.makedirs(os.path.dirname(best_path), exist_ok=True)
+                            torch.save({
+                                "model_state_dict": projector.state_dict(),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "scheduler_state_dict": scheduler.state_dict(),
+                                "step": steps,
+                                "best_val_loss": best_val_loss,
+                                "patience_counter": patience_counter
+                            }, best_path)
+                            print(f"🏆 Step {steps} — New best validation metric ({'test loss' if test_dataloader is not None else 'running train action_mse'}): {best_val_loss:.6f}! Saved best checkpoint.")
+                        else:
+                            patience_counter += 1
+                            print(f"📉 Step {steps} — Validation metric did not improve: {val_loss:.6f} (Best: {best_val_loss:.6f}). Patience: {patience_counter}/{args.patience}")
+
+                        if args.patience > 0 and patience_counter >= args.patience:
+                            print(f"🛑 Early stopping triggered! Validation metric did not improve for {args.patience} evaluations.")
+                            early_stop = True
 
                     # Video probes run regardless of protocol (A or B).
-                    # Video probes require OpenVLA (PyTorch) — skip for Octo runs
+                    # Pre-load the VLA model and create the embedding function
+                    emb_fn_to_use = None
                     if args.vla_type == "openvla":
-                        # Reload VLA to GPU for video probe, then offload again
                         if vla_model is None:
                             vla_model, processor = load_openvla_model(args.vla_checkpoint)
                         vla_model.to(DEVICE)
                         torch.cuda.empty_cache()
-                        log_projector_video_probe(
-                            vae=vae, projector=projector, vla_model=vla_model, processor=processor,
-                            step=steps, suite_name=_stats_suite, stats_path=stats_path,
-                            device=DEVICE, probe_task_name=PROBE_VAL_TASK, split_name="val",
-                            chunk_size=CHUNK_SIZE, normalize_emb=args.normalize_emb,
-                            use_vision_pool=args.use_vision_pool,
-                            text_backbone=args.text_backbone,
-                            vla_layer_idx=args.vla_layer_idx
-                        )
-                        log_projector_video_probe(
-                            vae=vae, projector=projector, vla_model=vla_model, processor=processor,
-                            step=steps, suite_name=_stats_suite, stats_path=stats_path,
-                            device=DEVICE, probe_task_name=PROBE_TRAIN_TASK, split_name="train",
-                            chunk_size=CHUNK_SIZE, normalize_emb=args.normalize_emb,
-                            use_vision_pool=args.use_vision_pool,
-                            text_backbone=args.text_backbone,
-                            vla_layer_idx=args.vla_layer_idx
-                        )
-                        vla_model.cpu()
-                        torch.cuda.empty_cache()
+                        emb_fn_to_use = _make_openvla_emb_fn(vla_model, processor, DEVICE, use_vision_pool=args.use_vision_pool, vla_layer_idx=args.vla_layer_idx, num_fusion_layers=args.num_fusion_layers)
                     elif args.vla_type == "smolvla" and smolvla_policy is not None:
                         from utils.data import _make_smolvla_emb_fn
                         smolvla_policy.to(DEVICE)
                         torch.cuda.empty_cache()
-                        smolvla_emb_fn = _make_smolvla_emb_fn(smolvla_policy, DEVICE)
-                        log_projector_video_probe(
-                            vae=vae, projector=projector, vla_model=None, processor=None,
-                            step=steps, suite_name=_stats_suite, stats_path=stats_path,
-                            device=DEVICE, probe_task_name=PROBE_VAL_TASK, split_name="val",
-                            chunk_size=CHUNK_SIZE, emb_fn=smolvla_emb_fn,
-                            normalize_emb=args.normalize_emb,
-                            use_vision_pool=False,
-                            text_backbone=args.text_backbone
-                        )
-                        log_projector_video_probe(
-                            vae=vae, projector=projector, vla_model=None, processor=None,
-                            step=steps, suite_name=_stats_suite, stats_path=stats_path,
-                            device=DEVICE, probe_task_name=PROBE_TRAIN_TASK, split_name="train",
-                            chunk_size=CHUNK_SIZE, emb_fn=smolvla_emb_fn,
-                            normalize_emb=args.normalize_emb,
-                            use_vision_pool=False,
-                            text_backbone=args.text_backbone
-                        )
-                        smolvla_policy.cpu()
-                        gc.collect()
+                        emb_fn_to_use = _make_smolvla_emb_fn(smolvla_policy, DEVICE, vla_layer_idx=args.vla_layer_idx, num_fusion_layers=args.num_fusion_layers)
+                    elif args.vla_type == "pi0" and pi0_policy is not None:
+                        pi0_policy.to(DEVICE)
                         torch.cuda.empty_cache()
+                        emb_fn_to_use = _make_pi0_emb_fn(pi0_policy, pi0_tokenizer, DEVICE, num_fusion_layers=args.num_fusion_layers)
                     elif args.vla_type == "octo" and octo_emb_fn is not None:
-                        log_projector_video_probe(
-                            vae=vae, projector=projector, vla_model=None, processor=None,
-                            step=steps, suite_name=_stats_suite, stats_path=stats_path,
-                            device=DEVICE, probe_task_name=PROBE_VAL_TASK, split_name="val",
-                            chunk_size=CHUNK_SIZE, emb_fn=octo_emb_fn, normalize_emb=args.normalize_emb,
-                            use_vision_pool=args.use_vision_pool,
-                            text_backbone=args.text_backbone
-                        )
-                        log_projector_video_probe(
-                            vae=vae, projector=projector, vla_model=None, processor=None,
-                            step=steps, suite_name=_stats_suite, stats_path=stats_path,
-                            device=DEVICE, probe_task_name=PROBE_TRAIN_TASK, split_name="train",
-                            chunk_size=CHUNK_SIZE, emb_fn=octo_emb_fn, normalize_emb=args.normalize_emb,
-                            use_vision_pool=args.use_vision_pool,
-                            text_backbone=args.text_backbone
-                        )
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                        emb_fn_to_use = octo_emb_fn
+
+                    if emb_fn_to_use is not None:
+                        probe_tasks = [
+                            (PROBE_VAL_TASK, "val"),
+                            (PROBE_TRAIN_TASK, "train"),
+                            (PROBE_EXTRA_TASK_1, "val_extra1"),
+                            (PROBE_EXTRA_TASK_2, "val_extra2")
+                        ]
+                        for task_name, split in probe_tasks:
+                            for ex_steps in [CHUNK_SIZE, 1]:
+                                log_projector_video_probe(
+                                    vae=vae, projector=projector, vla_model=None, processor=None,
+                                    step=steps, suite_name=_stats_suite, stats_path=stats_path,
+                                    device=DEVICE, probe_task_name=task_name, split_name=split,
+                                    chunk_size=CHUNK_SIZE, emb_fn=emb_fn_to_use, normalize_emb=args.normalize_emb,
+                                    use_vision_pool=args.use_vision_pool,
+                                    text_backbone=args.text_backbone,
+                                    vla_layer_idx=args.vla_layer_idx,
+                                    num_fusion_layers=args.num_fusion_layers,
+                                    exec_steps=ex_steps
+                                )
+
+                    # Offload the VLA model back to CPU to save VRAM for training
+                    if args.vla_type == "openvla":
+                        vla_model.cpu()
+                    elif args.vla_type == "smolvla":
+                        smolvla_policy.cpu()
+                    elif args.vla_type == "pi0" and pi0_policy is not None:
+                        pi0_policy.cpu()
+                    
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
                     # Save checkpoint
                     base_dir = f"{args.save_dir}/{args.vla_type}/{args.suite}/chunk_{CHUNK_SIZE}_zdim_{Z_DIM}"
@@ -845,16 +933,20 @@ def train_projector():
                         "model_state_dict": projector.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
-                        "step": steps
-                    }, f"{base_dir}/{args.projector_type}_{args.projector_arch}_loss_{args.loss}_seed_{args.seed}_step_{steps}.pt")
+                        "step": steps,
+                        "best_val_loss": best_val_loss,
+                        "patience_counter": patience_counter
+                    }, f"{base_dir}/{ckpt_prefix}_step_{steps}.pt")
 
                     projector.train()
+
+                    if early_stop:
+                        break
 
         pbar.close()
 
     finally:
-        if octo_worker is not None:
-            octo_worker.stop()
+        pass
 
     if args.use_wandb: wandb.finish()
     print("🎯 Projector Training Complete!")

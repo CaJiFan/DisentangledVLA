@@ -34,6 +34,24 @@ except ImportError:
 # even when libegl1 is installed.  Force the EGL platform so libEGL loads.
 # os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+def quat2axisangle(quat):
+    """
+    Converts quaternion to axis-angle format.
+    Args:
+        quat (np.array): (x,y,z,w) vec4 float angles
+    Returns:
+        np.array: (ax,ay,az) axis-angle exponential coordinates
+    """
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if np.isclose(den, 0.0):
+        return np.zeros(3)
+    return (quat[:3] * 2.0 * np.arccos(quat[3])) / den
+
 try:
     from libero.libero import benchmark
     from libero.libero.envs import OffScreenRenderEnv
@@ -138,7 +156,8 @@ def get_text_action_ram_cached_dataloader(
     batch_size=128,
     train_split_ratio=None,  # None = Protocol A (all tasks, no held-out split)
                               # int  = Protocol B (task-level split, e.g. 7 of 10)
-    text_backbone="clip"
+    text_backbone="clip",
+    return_states=False
 ):
     """
     Protocol A (train_split_ratio=None, industry standard for LIBERO):
@@ -159,10 +178,6 @@ def get_text_action_ram_cached_dataloader(
         model_id = "HuggingFaceTB/SmolLM2-360M-Instruct"
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-        text_encoder = AutoModel.from_pretrained(model_id).to(device).eval()
-    elif text_backbone == "octo_t5":
-        model_id = "t5-base"
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
         text_encoder = AutoModel.from_pretrained(model_id).to(device).eval()
     elif text_backbone == "openvla_llama":
         model_id = "meta-llama/Llama-2-7b-hf"
@@ -225,10 +240,17 @@ def get_text_action_ram_cached_dataloader(
                 text_cache[instr] = emb.cpu().float()
 
         if instr not in task_dict:
-            task_dict[instr] = {'actions': [], 'texts': []}
+            task_dict[instr] = {'actions': [], 'texts': [], 'states': []}
 
         task_dict[instr]['actions'].append(act)
         task_dict[instr]['texts'].append(text_cache[instr])
+        if return_states:
+            state = item['observation']['proprio'][0]
+            if isinstance(state, np.ndarray):
+                state = torch.from_numpy(np.copy(state)).float()
+            elif isinstance(state, torch.Tensor):
+                state = state.float()
+            task_dict[instr]['states'].append(state)
             
     # 3. Aggressive VRAM Cleanup (Crucial before VAE training)
     del text_encoder, tokenizer
@@ -264,30 +286,49 @@ def get_text_action_ram_cached_dataloader(
         print("="*50 + "\n")
 
     train_actions, train_texts = [], []
+    train_states = []
     for task in train_task_names:
         train_actions.extend(task_dict[task]['actions'])
         train_texts.extend(task_dict[task]['texts'])
+        if return_states:
+            train_states.extend(task_dict[task]['states'])
 
     train_action_tensor = torch.stack(train_actions, dim=0)
     train_text_tensor   = torch.stack(train_texts,   dim=0)
-    print(f"Train Actions: {train_action_tensor.shape}, Texts: {train_text_tensor.shape}")
+    
+    if return_states:
+        train_state_tensor = torch.stack(train_states, dim=0)
+        print(f"Train Actions: {train_action_tensor.shape}, Texts: {train_text_tensor.shape}, States: {train_state_tensor.shape}")
+        train_dataset    = TensorDataset(train_action_tensor, train_text_tensor, train_state_tensor)
+    else:
+        print(f"Train Actions: {train_action_tensor.shape}, Texts: {train_text_tensor.shape}")
+        train_dataset    = TensorDataset(train_action_tensor, train_text_tensor)
 
     action_stats = ds.dataset_statistics
     print(f"✅ Extracted Official Dataset Statistics for Un-normalization.")
 
-    train_dataset    = TensorDataset(train_action_tensor, train_text_tensor)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                   num_workers=0, drop_last=True)
 
     if held_out_task_names:
         test_actions, test_texts = [], []
+        test_states = []
         for task in held_out_task_names:
             test_actions.extend(task_dict[task]['actions'])
             test_texts.extend(task_dict[task]['texts'])
+            if return_states:
+                test_states.extend(task_dict[task]['states'])
         test_action_tensor = torch.stack(test_actions, dim=0)
         test_text_tensor   = torch.stack(test_texts,   dim=0)
-        print(f"Test  Actions: {test_action_tensor.shape}, Texts: {test_text_tensor.shape}")
-        test_dataset    = TensorDataset(test_action_tensor, test_text_tensor)
+        
+        if return_states:
+            test_state_tensor = torch.stack(test_states, dim=0)
+            print(f"Test  Actions: {test_action_tensor.shape}, Texts: {test_text_tensor.shape}, States: {test_state_tensor.shape}")
+            test_dataset    = TensorDataset(test_action_tensor, test_text_tensor, test_state_tensor)
+        else:
+            print(f"Test  Actions: {test_action_tensor.shape}, Texts: {test_text_tensor.shape}")
+            test_dataset    = TensorDataset(test_action_tensor, test_text_tensor)
+            
         test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
                                      num_workers=0, drop_last=False)
     else:
@@ -418,7 +459,7 @@ def get_full_trajectory_dataloader(
     task_dict = {}
     
     print(f"\n⏳ Extracting FULL Trajectories from {suite} HDF5s...")
-    action_stats = torch.load(stats_path)
+    action_stats = torch.load(stats_path, weights_only=False)
     
     # 2. Extract the exact normalization bounds for the specific suite
     suite_name_in_stats = f"{suite}_no_noops"
@@ -514,7 +555,7 @@ def get_full_trajectory_dataloader(
     print(test_action_tensor.shape, test_text_tensor.shape)
     
     # Load previously saved stats to keep math identical to OpenVLA
-    action_stats = torch.load(stats_path)
+    action_stats = torch.load(stats_path, weights_only=False)
     
     train_dataset = TensorDataset(train_action_tensor, train_text_tensor)
     test_dataset = TensorDataset(test_action_tensor, test_text_tensor)
@@ -523,9 +564,12 @@ def get_full_trajectory_dataloader(
     
     return train_dataloader, test_dataloader, action_stats
 
-def log_video_probe(vae, step, suite_name, stats_path, device, probe_task_name, split_name, chunk_size, text_backbone):
-    """Runs a receding-horizon video probe for chunk-based VAEs and logs it to WandB."""
-    print(f"\n🎥 Generating {split_name.upper()} Video Probe (Chunk Size {chunk_size}) for Step {step}...")
+def log_video_probe(vae, step, suite_name, stats_path, device, probe_task_name, split_name, chunk_size, text_backbone, exec_steps=1, temporal_ensemble=True, ensemble_k=0.01):
+    """Runs a video probe for chunk-based VAEs (with Temporal Ensembling by default) and logs it to WandB."""
+    if temporal_ensemble:
+        print(f"\n🎥 Generating {split_name.upper()} Video Probe (Temporal Ensembling k={ensemble_k}, Chunk Size {chunk_size}) for Step {step}...")
+    else:
+        print(f"\n🎥 Generating {split_name.upper()} Video Probe (Chunk Size {chunk_size}, exec_steps={exec_steps}) for Step {step}...")
     
     probe_demo_id = "demo_0"
     
@@ -553,18 +597,16 @@ def log_video_probe(vae, step, suite_name, stats_path, device, probe_task_name, 
         return
         
     with h5py.File(hdf5_path, "r") as f:
+        demo_keys = sorted(list(f["data"].keys()), key=lambda x: int(x.split("_")[1]) if "_" in x and x.split("_")[1].isdigit() else 0)
+        probe_demo_id = demo_keys[0] if len(demo_keys) > 0 else "demo_0"
         gt_actions = f[f"data/{probe_demo_id}/actions"][:]
-        init_state = f[f"data/{probe_demo_id}/states"][0] 
+        init_state = f[f"data/{probe_demo_id}/states"][0]
     
     # 3. Embed Instruction Dynamically
     if text_backbone == "smollm":
         model_id = "HuggingFaceTB/SmolLM2-360M-Instruct"
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-        text_encoder = AutoModel.from_pretrained(model_id).to(device).eval()
-    elif text_backbone == "octo_t5":
-        model_id = "t5-base"
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
         text_encoder = AutoModel.from_pretrained(model_id).to(device).eval()
     elif text_backbone == "openvla_llama":
         model_id = "meta-llama/Llama-2-7b-hf"
@@ -590,7 +632,7 @@ def log_video_probe(vae, step, suite_name, stats_path, device, probe_task_name, 
             text_emb = (sum_embeddings / sum_mask) # Shape: (1, dim)
     
     # 4. Pre-Normalize the ENTIRE Ground Truth Sequence
-    action_stats = torch.load(stats_path)
+    action_stats = torch.load(stats_path, weights_only=False)
     stats = action_stats[f"{raw_suite_name}_no_noops"]['action']
     action_min = torch.tensor(stats['min']).float().to(device)
     action_max = torch.tensor(stats['max']).float().to(device)
@@ -604,45 +646,62 @@ def log_video_probe(vae, step, suite_name, stats_path, device, probe_task_name, 
     # 5. Initialize MuJoCo Environment
     env_args = {"bddl_file_name": os.path.join(bmark.get_task_bddl_file_path(task_id))}
     env = OffScreenRenderEnv(**env_args)
-    env.reset()
+    obs = env.reset()
     env.set_init_state(init_state) 
+    # Execute dummy actions for 15 steps to let physics settle (standard LIBERO protocol)
+    dummy_action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0])
+    for _ in range(15):
+        obs, _, _, _ = env.step(dummy_action)
     
     video_path = f"/tmp/vae_probe_{split_name}_{step}.mp4"
     writer = imageio.get_writer(video_path, fps=30, macro_block_size=1)
     
     seq_len = len(norm_gt)
-    
     task_success = False
 
-    # 6. Full-chunk execution loop: re-plan every chunk_size steps
-    t = 0
-    while t < seq_len:
-        # Extract the chunk window
-        if t + chunk_size <= seq_len:
-            chunk = norm_gt[t : t + chunk_size]
-        else:
-            valid_len = seq_len - t
-            pad_len = chunk_size - valid_len
-            padding = norm_gt[-1].repeat(pad_len, 1)
-            chunk = torch.cat([norm_gt[t : seq_len], padding], dim=0)
+    if temporal_ensemble:
+        action_dim = len(action_min)
+        all_time_actions = np.zeros((seq_len, seq_len + chunk_size, action_dim), dtype=np.float32)
+        t = 0
+        while t < seq_len:
+            if t + chunk_size <= seq_len:
+                chunk = norm_gt[t : t + chunk_size]
+            else:
+                valid_len = seq_len - t
+                pad_len = chunk_size - valid_len
+                padding = norm_gt[-1].repeat(pad_len, 1)
+                chunk = torch.cat([norm_gt[t : seq_len], padding], dim=0)
 
-        chunk = chunk.unsqueeze(0)  # (1, chunk_size, 7)
+            chunk = chunk.unsqueeze(0)
 
-        with torch.no_grad():
-            encode_args = (chunk, text_emb) if vae.encode.__code__.co_argcount > 2 else (chunk,)
-            mu, _ = vae.encode(*encode_args)
-            pred_chunk_norm = vae.decode(mu, text_emb)[0]  # (chunk_size, 7)
+            with torch.no_grad():
+                decode_text = torch.zeros_like(text_emb) if getattr(vae, 'no_text_decoder', False) else text_emb
+                encode_args = (chunk, text_emb) if vae.encode.__code__.co_argcount > 2 else (chunk,)
+                mu, _ = vae.encode(*encode_args)
+                if getattr(vae, 'use_state', False):
+                    state = np.concatenate((obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]))
+                    state_tensor = torch.tensor(state).float().to(device).unsqueeze(0)
+                    pred_chunk_norm = vae.decode(mu, decode_text, state_tensor)[0]
+                else:
+                    pred_chunk_norm = vae.decode(mu, decode_text)[0]
 
-        # Execute all steps in the predicted chunk before re-planning
-        steps_to_execute = chunk_size if t + chunk_size <= seq_len else seq_len - t
-        done = False
-        for i in range(steps_to_execute):
-            pred_action_norm = pred_chunk_norm[i]
+            all_time_actions[t, t : t + chunk_size] = pred_chunk_norm.cpu().numpy()
 
-            pred_action = (pred_action_norm + 1.0) / 2.0 * (action_max - action_min) + action_min
-            pred_action = pred_action_norm * action_mask + pred_action * (1.0 - action_mask)
-            action_np = pred_action.cpu().numpy()
-            action_np[-1] = 1.0 if action_np[-1] > 0.0 else -1.0
+            start_idx = max(0, t - chunk_size + 1)
+            actions_for_curr_step = all_time_actions[start_idx : t + 1, t]
+
+            num_actions = len(actions_for_curr_step)
+            ages = np.arange(num_actions)[::-1]
+            weights = np.exp(-ensemble_k * ages)
+            weights = weights / weights.sum()
+
+            pred_action_norm = (actions_for_curr_step * weights[:, None]).sum(axis=0)
+            pred_action_norm = np.clip(pred_action_norm, -1.0, 1.0)
+
+            unnorm_action = (pred_action_norm + 1.0) / 2.0 * (action_max.cpu().numpy() - action_min.cpu().numpy() + 1e-5) + action_min.cpu().numpy()
+            pred_action = unnorm_action * action_mask.cpu().numpy() + pred_action_norm * (1.0 - action_mask.cpu().numpy())
+            action_np = pred_action.copy()
+            action_np[-1] = 1.0 if pred_action_norm[-1] > 0.0 else -1.0
 
             obs, reward, done, info = env.step(action_np)
             img = np.flipud(obs['agentview_image'])
@@ -651,10 +710,54 @@ def log_video_probe(vae, step, suite_name, stats_path, device, probe_task_name, 
             if done:
                 task_success = True
                 break
+            t += 1
+    else:
+        # Standard chunk execution loop: re-plan every exec_steps steps
+        t = 0
+        while t < seq_len:
+            if t + chunk_size <= seq_len:
+                chunk = norm_gt[t : t + chunk_size]
+            else:
+                valid_len = seq_len - t
+                pad_len = chunk_size - valid_len
+                padding = norm_gt[-1].repeat(pad_len, 1)
+                chunk = torch.cat([norm_gt[t : seq_len], padding], dim=0)
 
-        t += chunk_size
-        if done:
-            break
+            chunk = chunk.unsqueeze(0)
+
+            with torch.no_grad():
+                decode_text = torch.zeros_like(text_emb) if getattr(vae, 'no_text_decoder', False) else text_emb
+                encode_args = (chunk, text_emb) if vae.encode.__code__.co_argcount > 2 else (chunk,)
+                mu, _ = vae.encode(*encode_args)
+                if getattr(vae, 'use_state', False):
+                    state = np.concatenate((obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]))
+                    state_tensor = torch.tensor(state).float().to(device).unsqueeze(0)
+                    pred_chunk_norm = vae.decode(mu, decode_text, state_tensor)[0]
+                else:
+                    pred_chunk_norm = vae.decode(mu, decode_text)[0]
+
+            steps_to_execute = chunk_size if t + chunk_size <= seq_len else seq_len - t
+            num_steps_this_loop = min(exec_steps, steps_to_execute)
+            done = False
+            for i in range(num_steps_this_loop):
+                pred_action_norm = pred_chunk_norm[i]
+
+                unnorm_action = (pred_action_norm + 1.0) / 2.0 * (action_max - action_min + 1e-5) + action_min
+                pred_action = unnorm_action * action_mask + pred_action_norm * (1.0 - action_mask)
+                action_np = pred_action.cpu().numpy()
+                action_np[-1] = 1.0 if pred_action_norm[-1] > 0.0 else -1.0
+
+                obs, reward, done, info = env.step(action_np)
+                img = np.flipud(obs['agentview_image'])
+                writer.append_data(cv2.resize(img, (224, 224), interpolation=cv2.INTER_CUBIC))
+
+                if done:
+                    task_success = True
+                    break
+
+            t += num_steps_this_loop
+            if done:
+                break
             
     writer.close()
     env.close()
@@ -668,11 +771,11 @@ def log_video_probe(vae, step, suite_name, stats_path, device, probe_task_name, 
             f"eval_videos/{split_name}_probe": wandb.Video(video_path, fps=30, format="mp4"),
             f"eval_metrics/probe_{split_name}_success": float(task_success),
             "global_step": step
-        })
+        }, step=step)
     status = "✅ SUCCESS" if task_success else "❌ FAILED"
     print(f"🎥 {split_name.upper()} Video uploaded to WandB! Outcome: {status}")
 
-def _make_openvla_emb_fn(vla_model, processor, device, use_vision_pool=False, vla_layer_idx=-1):
+def _make_openvla_emb_fn(vla_model, processor, device, use_vision_pool=False, vla_layer_idx=-1, num_fusion_layers=1):
     """
     Build an emb_fn callable from an OpenVLA model + processor.
     emb_fn(image_pil, instruction) → torch.Tensor (1, vla_dim) float32 on `device`
@@ -681,6 +784,13 @@ def _make_openvla_emb_fn(vla_model, processor, device, use_vision_pool=False, vl
     vla_prompt_tmpl = "In: {}\nOut: "
     _img_token_id = getattr(vla_model.config, "image_token_index",
                     getattr(vla_model.config, "image_token_id", None)) if use_vision_pool else None
+
+    if num_fusion_layers > 1:
+        total_layers = len(vla_model.language_model.model.layers)
+        step = total_layers // (num_fusion_layers + 1)
+        target_indices = [step * (i + 1) - 1 for i in range(num_fusion_layers)]
+    else:
+        target_indices = [vla_layer_idx]
 
     def emb_fn(image_pil, instruction: str):
         prompt = vla_prompt_tmpl.format(instruction)
@@ -692,16 +802,24 @@ def _make_openvla_emb_fn(vla_model, processor, device, use_vision_pool=False, vl
             inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
         with torch.no_grad():
             out = vla_model(**inputs, output_hidden_states=True, return_dict=True)
-        hs = out.hidden_states[vla_layer_idx]  # (1, L, D)
-        if use_vision_pool and _img_token_id is not None:
-            img_mask = (inputs["input_ids"] == _img_token_id).unsqueeze(-1).float()  # (1, L, 1)
-            vision_tokens = hs * img_mask
-            n_img = img_mask.sum(dim=1).clamp(min=1)
-            emb = (vision_tokens.sum(dim=1) / n_img).float().to(device)  # (1, D)
+            
+        layer_embs = []
+        for idx in target_indices:
+            hs = out.hidden_states[idx]  # (1, L, D)
+            if use_vision_pool and _img_token_id is not None:
+                img_mask = (inputs["input_ids"] == _img_token_id).unsqueeze(-1).float()  # (1, L, 1)
+                vision_tokens = hs * img_mask
+                n_img = img_mask.sum(dim=1).clamp(min=1)
+                emb = (vision_tokens.sum(dim=1) / n_img).float().to(device)  # (1, D)
+            else:
+                last_tok_idx = inputs.attention_mask.sum(dim=1) - 1
+                emb = hs[0, last_tok_idx[0]].unsqueeze(0).float().to(device)  # (1, D)
+            layer_embs.append(emb)
+            
+        if num_fusion_layers > 1:
+            return torch.stack(layer_embs, dim=1) # (1, num_fusion_layers, D)
         else:
-            last_tok_idx = inputs.attention_mask.sum(dim=1) - 1
-            emb = hs[0, last_tok_idx[0]].unsqueeze(0).float().to(device)  # (1, D)
-        return emb
+            return layer_embs[0]
 
     return emb_fn
 
@@ -717,12 +835,10 @@ def _get_clip_text_emb(instruction: str, device):
     return emb
 
 
-def _make_smolvla_emb_fn(policy, device, vla_layer_idx=-1):
+def _make_smolvla_emb_fn(policy, device, vla_layer_idx=-1, num_fusion_layers=1):
     """
     Build an emb_fn for SmolVLA.
-    emb_fn(image_pil, instruction) -> torch.Tensor (1, 960) float32 on `device`
-
-    The policy should already be on `device` when emb_fn is called.
+    emb_fn(image_pil, instruction) -> torch.Tensor float32 on `device`
     """
     from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
 
@@ -734,12 +850,34 @@ def _make_smolvla_emb_fn(policy, device, vla_layer_idx=-1):
     _resize = getattr(policy.config, "resize_imgs_with_padding", None) or (256, 256)
     _tgt_h, _tgt_w = _resize
 
-    target_layer = vlm.vlm.model.layers[vla_layer_idx]
+    total_layers = 16
+    if num_fusion_layers > 1:
+        step = total_layers // (num_fusion_layers + 1)
+        target_indices = [step * (i + 1) - 1 for i in range(num_fusion_layers)]
+    else:
+        target_indices = [vla_layer_idx]
+
     captured = {}
-    def hook_fn(module, input, output):
-        hs = output[0] if isinstance(output, tuple) else output
-        captured['hs'] = hs.float().detach().cpu()
-    handle = target_layer.register_forward_hook(hook_fn)
+    handles = []
+    
+    def make_hook_fn(layer_idx_key):
+        def hook_fn(module, args):
+            hs = args[0]
+            captured[layer_idx_key] = hs.float().detach().cpu()
+        return hook_fn
+
+    for l_idx in target_indices:
+        actual_idx = l_idx if l_idx != -1 else 15
+        if hasattr(vlm.vlm.model, "text_model") and hasattr(vlm.vlm.model.text_model, "layers"):
+            target_layer = vlm.vlm.model.text_model.layers[actual_idx].input_layernorm
+            handle = target_layer.register_forward_pre_hook(make_hook_fn(l_idx))
+        else:
+            target_layer = vlm.vlm.model.layers[actual_idx]
+            def legacy_hook_fn(module, input, output, key=l_idx):
+                hs = output[0] if isinstance(output, tuple) else output
+                captured[key] = hs.float().detach().cpu()
+            handle = target_layer.register_forward_hook(legacy_hook_fn)
+        handles.append(handle)
 
     @torch.no_grad()
     def emb_fn(image_pil, instruction: str):
@@ -759,7 +897,7 @@ def _make_smolvla_emb_fn(policy, device, vla_layer_idx=-1):
         images_tensor = img_t.unsqueeze(0).to(device, dtype=vlm_dtype)  # (1, 3, H, W)
         img_masks = torch.ones(1, dtype=torch.bool, device=device)
 
-        # Zero state (state_proj is float32 even when VLM backbone is bf16)
+        # Zero state
         state = torch.zeros(1, flow.config.max_state_dim, device=device, dtype=state_dtype)
 
         # Prefix embeddings
@@ -773,27 +911,95 @@ def _make_smolvla_emb_fn(policy, device, vla_layer_idx=-1):
         att_2d  = make_att_2d_masks(prefix_pad, prefix_att)
         pos_ids = torch.cumsum(prefix_pad, dim=1) - 1
 
-        # VLM forward — fill_kv_cache=True routes all layers through forward_attn_layer,
-        # which handles inputs_embeds[1]=None gracefully (skips action expert).
         (prefix_out, _), _ = vlm.forward(
             attention_mask=att_2d,
             position_ids=pos_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
-            use_cache=False,
-            fill_kv_cache=True,
+            use_cache=True,
         )
         
-        prefix_out = captured['hs']
+        valid = prefix_pad.unsqueeze(-1).float().cpu()          # (1, seq_len, 1)
+        if num_fusion_layers > 1:
+            batch_layer_embs = []
+            for l_idx in target_indices:
+                prefix_out_l = captured[l_idx]
+                emb_l = (prefix_out_l.float() * valid).sum(1) / valid.sum(1).clamp(min=1)
+                batch_layer_embs.append(emb_l)
+            emb = torch.stack(batch_layer_embs, dim=1)  # (1, num_fusion_layers, 960)
+        else:
+            prefix_out_l = captured[target_indices[0]]
+            emb = (prefix_out_l.float() * valid).sum(1) / valid.sum(1).clamp(min=1)  # (1, 960)
+            
+        captured.clear()
+        return emb.to(device)
 
-        # Mean-pool over valid prefix token positions → (1, 960)
-        valid = prefix_pad.unsqueeze(-1).float()
-        emb   = (prefix_out.float() * valid).sum(1) / valid.sum(1).clamp(min=1)
+    return emb_fn
+
+
+def _make_pi0_emb_fn(pi0_policy, pi0_tokenizer, device, num_fusion_layers=3):
+    """
+    Build an emb_fn for Pi0.
+    emb_fn(image_pil, instruction) -> torch.Tensor (1, num_fusion_layers, 2048) float32 on `device`
+    """
+    import torch.nn.functional as F
+    
+    trunk = pi0_policy.model.paligemma_with_expert.paligemma.model.language_model.layers
+    n_layers = len(trunk)
+    step = n_layers // num_fusion_layers
+    target_indices = [step * i + (step - 1) for i in range(num_fusion_layers)]
+    
+    layer_outputs = {}
+    def get_pre_hook(name):
+        def hook(model, args):
+            out = args[0]
+            layer_outputs[name] = out
+        return hook
+
+    handles = []
+    for idx in target_indices:
+        target_module = trunk[idx].input_layernorm
+        handle = target_module.register_forward_pre_hook(get_pre_hook(f"layer_{idx}"))
+        handles.append(handle)
+
+    @torch.no_grad()
+    def emb_fn(image_pil, instruction: str):
+        img_np = np.array(image_pil)
+        img_t = torch.from_numpy(img_np).float().permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
+        # Resize to (480, 640) as expected by lerobot/pi0
+        img_t = F.interpolate(img_t, size=(480, 640), mode='bilinear', align_corners=False)
+
+        if pi0_tokenizer is not None:
+            tokens = pi0_tokenizer([instruction], padding="max_length", max_length=48, truncation=True, return_tensors="pt")
+            lang_tokens = tokens["input_ids"].to(device)
+            lang_mask = tokens["attention_mask"].bool().to(device)
+        else:
+            lang_tokens = torch.zeros((1, 48), dtype=torch.long, device=device)
+            lang_mask = torch.ones((1, 48), dtype=torch.bool, device=device)
+
+        dummy_inputs = {
+            "observation.images.camera0": img_t,
+            "observation.images.camera1": torch.zeros_like(img_t),
+            "observation.images.camera2": torch.zeros_like(img_t),
+            "observation.language.tokens": lang_tokens,
+            "observation.language.attention_mask": lang_mask,
+            "observation.state": torch.zeros((1, 14), dtype=torch.float32, device=device),
+            "action": torch.zeros((1, 50, 14), dtype=torch.float32, device=device),
+            "task": instruction
+        }
+
+        layer_outputs.clear()
+        _ = pi0_policy(dummy_inputs)
+
+        extracted_layers = []
+        for idx in target_indices:
+            layer_out = layer_outputs[f"layer_{idx}"]
+            causal_token = layer_out[:, -1, :] # [1, 2048]
+            extracted_layers.append(causal_token)
+
+        stacked_emb = torch.stack(extracted_layers, dim=1) # [1, num_fusion_layers, 2048]
+        return stacked_emb.to(device)
         
-        # We don't remove the hook here because emb_fn is called multiple times
-        captured.pop('hs', None)
-        return emb.to(device)  # (1, 960)
-
     return emb_fn
 
 
@@ -802,7 +1008,8 @@ def log_projector_video_probe(
     step, suite_name, stats_path, device,
     probe_task_name, split_name, chunk_size,
     emb_fn=None, normalize_emb=False, use_vision_pool=False,
-    text_backbone="clip", vla_layer_idx=-1
+    text_backbone="clip", vla_layer_idx=-1, num_fusion_layers=1, exec_steps=None,
+    temporal_ensemble=True, ensemble_k=0.01
 ):
     if not _HAS_LIBERO:
         print("⚠️  LIBERO not available — skipping projector video probe.")
@@ -811,14 +1018,8 @@ def log_projector_video_probe(
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.pop("PYOPENGL_PLATFORM", None)
     """
-    Chunk-based receding-horizon video probe for the full projector pipeline:
+    Chunk-based video probe for the full projector pipeline (with Temporal Ensembling by default):
       env obs image + instruction → VLA → projector → z_mu → VAE decoder → action chunk
-
-    Executes the FULL predicted chunk between re-planning calls (not just the first
-    action). This is the correct execution strategy for a chunk policy:
-      - Temporal coherence within the chunk is preserved.
-      - Gripper transitions encoded mid-chunk are actually executed.
-      - VLA is called ~T/chunk_size times instead of T times (less jitter).
 
     Args:
         emb_fn: Optional callable (image_pil, instruction) → torch.Tensor (1, D) on `device`.
@@ -828,10 +1029,10 @@ def log_projector_video_probe(
     """
     if emb_fn is None:
         # Backwards-compatible: build from OpenVLA model/processor
-        emb_fn = _make_openvla_emb_fn(vla_model, processor, device, use_vision_pool=use_vision_pool, vla_layer_idx=vla_layer_idx)
-
-    print(f"\n🎥 Generating Projector {split_name.upper()} Video Probe for Step {step}...")
-    probe_demo_id = "demo_0"
+        if vla_model is None or processor is None:
+            raise ValueError("Must provide either emb_fn OR (vla_model, processor) to log_projector_video_probe")
+        emb_fn = _make_openvla_emb_fn(vla_model, processor, device, use_vision_pool=use_vision_pool,
+                                      vla_layer_idx=vla_layer_idx, num_fusion_layers=num_fusion_layers)
 
     # 1. Match task to benchmark
     bmark = benchmark.get_benchmark_dict()[suite_name]()
@@ -840,135 +1041,122 @@ def log_projector_video_probe(
         if bmark.get_task(i).name + '_demo' == probe_task_name:
             task_id = i
             break
+
     if task_id is None:
-        print(f"⚠️ Probe task '{probe_task_name}' not found. Skipping video.")
+        print(f"⚠️  [probe] Task '{probe_task_name}' not in benchmark {suite_name}. Skipping probe.")
         return
 
     instruction = bmark.get_task(task_id).language
 
-    # 2. Load init state from HDF5
+    # 2. Extract GT init state from HDF5 (same starting position as demonstrations)
     raw_suite_name = suite_name.replace("_no_noops", "")
     data_dir = f"/mnt/Data/cjimenez/LIBERO/libero/datasets/{raw_suite_name}_no_noops_hdf5"
     hdf5_path = os.path.join(data_dir, f"{probe_task_name}.hdf5")
     if not os.path.exists(hdf5_path):
-        print(f"🧨 Projector Video Probe Error: Could not find HDF5 at {hdf5_path}")
+        print(f"⚠️  [probe] HDF5 file not found: {hdf5_path}. Skipping probe.")
         return
+
     with h5py.File(hdf5_path, "r") as f:
-        gt_actions = f[f"data/{probe_demo_id}/actions"][:]
+        demo_keys = sorted(list(f["data"].keys()),
+                           key=lambda x: int(x.split("_")[1]) if "_" in x and x.split("_")[1].isdigit() else 0)
+        probe_demo_id = demo_keys[0] if demo_keys else "demo_0"
         init_state = f[f"data/{probe_demo_id}/states"][0]
+        gt_actions = f[f"data/{probe_demo_id}/actions"][:]
 
-    print(f"  [probe] Loading {text_backbone} to embed VAE instruction...")
-    if text_backbone == "smollm":
-        model_id = "HuggingFaceTB/SmolLM2-360M-Instruct"
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-        text_encoder = AutoModel.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device).eval()
-    elif text_backbone == "octo_t5":
-        model_id = "t5-base"
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        text_encoder = AutoModel.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device).eval()
-    elif text_backbone == "openvla_llama":
-        model_id = "meta-llama/Llama-2-7b-hf"
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-        text_encoder = AutoModel.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device).eval()
-    else: # Fallback to CLIP
-        model_id = "openai/clip-vit-base-patch32"
-        tokenizer = CLIPTokenizer.from_pretrained(model_id)
-        text_encoder = CLIPTextModel.from_pretrained(model_id).to(device).eval()
-
-    text_inputs = tokenizer([instruction], padding=True, truncation=True, return_tensors="pt").to(device)
-
-    with torch.no_grad():
-        if text_backbone == "clip":
-            vae_text_emb = text_encoder(**text_inputs).pooler_output
-        else:
-            outputs = text_encoder(**text_inputs)
-            hidden_states = outputs.last_hidden_state
-            mask = text_inputs.attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-            sum_embeddings = torch.sum(hidden_states * mask, dim=1)
-            sum_mask = torch.clamp(mask.sum(dim=1), min=1e-9)
-            vae_text_emb = (sum_embeddings / sum_mask) # Shape: (1, D)
-
-    # 🚨 CRITICAL: Free VRAM immediately before booting up MuJoCo!
-    del text_encoder, tokenizer, text_inputs
-    import gc; gc.collect()
-    torch.cuda.empty_cache()
-    print("  [probe] Text backbone VRAM freed.")
-
-    # 4. Action stats for un-normalisation
+    # 3. Load stats for action un-normalisation
     action_stats = torch.load(stats_path, weights_only=False)
     stats = action_stats[f"{raw_suite_name}_no_noops"]['action']
     action_min = torch.tensor(stats['min']).float().to(device)
     action_max = torch.tensor(stats['max']).float().to(device)
     action_mask = torch.tensor(stats['mask']).float().to(device)
 
+    # 4. Text embedding for VAE decoder (if text_cond VAE)
+    vae_text_emb = None
+    if getattr(vae, 'text_emb_dim', None) is not None and getattr(vae, 'text_emb_dim') > 0:
+        if text_backbone == "clip":
+            tok = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+            enc = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
+            t_inp = tok([instruction], padding=True, truncation=True, return_tensors="pt").to(device)
+            with torch.no_grad():
+                vae_text_emb = enc(**t_inp).pooler_output
+            del tok, enc
+        else:
+            tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-360M-Instruct")
+            if tok.pad_token is None: tok.pad_token = tok.eos_token
+            enc = AutoModel.from_pretrained("HuggingFaceTB/SmolLM2-360M-Instruct").to(device).eval()
+            t_inp = tok([instruction], padding=True, truncation=True, return_tensors="pt").to(device)
+            with torch.no_grad():
+                out = enc(**t_inp)
+                mask = t_inp.attention_mask.unsqueeze(-1).expand(out.last_hidden_state.size()).float()
+                vae_text_emb = (out.last_hidden_state * mask).sum(dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
+            del tok, enc
+        torch.cuda.empty_cache()
+
     # 5. Initialise MuJoCo environment
     env_args = {"bddl_file_name": os.path.join(bmark.get_task_bddl_file_path(task_id))}
     env = OffScreenRenderEnv(**env_args)
     obs = env.reset()
     env.set_init_state(init_state)
-    obs, _, _, _ = env.step(np.zeros(7))  # warmup step to get first rendered obs
+    obs, _, _, _ = env.step(np.zeros(7))
 
     video_path = f"/tmp/proj_probe_{split_name}_{step}.mp4"
     writer = imageio.get_writer(video_path, fps=30, macro_block_size=1)
 
     projector.eval()
-    # Give the policy generous time: GT demos are optimal-speed; a learned chunk
-    # policy can follow a slightly longer trajectory and still succeed.
-    # min 600 steps prevents trivially short demos from cutting off evaluation.
-    seq_len = max(len(gt_actions) * 2, 600)
+    seq_len = min(len(gt_actions) * 2, 400)
     done = False
     task_success = False
     first_action_logged = False
 
-    # 6. Chunk-based receding horizon: re-plan every chunk_size steps
-    for t in range(0, seq_len, chunk_size):
-        if done:
-            break
-
-        # Raw image — no rotation, consistent with build_octo_cache.py which
-        # reads raw HDF5 images (same MuJoCo output format) with no preprocessing.
-        obs_img_pil = Image.fromarray(obs['agentview_image'].astype(np.uint8))
-
-        with torch.no_grad():
-            vla_emb = emb_fn(obs_img_pil, instruction).to(device)  # (1, D)
-            if normalize_emb:
-                vla_emb = F.normalize(vla_emb, dim=-1)
-
-            if "Flow" in projector.__class__.__name__:
-                z_dim = projector.latent_dim
-                B_vla = vla_emb.size(0)
-                z_t = torch.randn(B_vla, z_dim, device=vla_emb.device)
-                dt = 1.0 / 10
-                for i in range(10):
-                    t_steps = torch.ones(B_vla, device=vla_emb.device) * (i / 10.0)
-                    v = projector(vla_emb, z_t, t_steps)
-                    z_t = z_t + v * dt
-                pred_mu = z_t
-            else:
-                _, pred_mu, _ = projector(vla_emb)
-            pred_chunk_norm = vae.decode(pred_mu, vae_text_emb)  # [1, chunk_size, 7]
-
-        # Execute all steps in the predicted chunk
-        for k in range(chunk_size):
-            if t + k >= seq_len:
+    if temporal_ensemble:
+        action_dim = len(action_min)
+        all_time_actions = np.zeros((seq_len, seq_len + chunk_size, action_dim), dtype=np.float32)
+        for t in range(seq_len):
+            if done:
                 break
-            pred_action_norm = pred_chunk_norm[0, k]  # [7], in [-1, 1] (Tanh decoder output)
-            # Unnorm: inverse of (x - min) / (max - min) * 2 - 1
-            pred_action_unnorm = (pred_action_norm + 1.0) / 2.0 * (action_max - action_min) + action_min
-            # mask=1 → dim was normalised → use unnorm; mask=0 → dim kept raw (e.g. gripper ±1) → use norm
-            pred_action = pred_action_unnorm * action_mask + pred_action_norm * (1.0 - action_mask)
-            action_np = pred_action.cpu().numpy()
-            action_np[-1] = 1.0 if action_np[-1] > 0.0 else -1.0  # binarise gripper
+            obs_img_pil = Image.fromarray(obs['agentview_image'].astype(np.uint8))
+            with torch.no_grad():
+                vla_emb = emb_fn(obs_img_pil, instruction).to(device)
+                if normalize_emb:
+                    vla_emb = F.normalize(vla_emb, dim=-1)
 
-            # Log first action of first chunk for quick diagnostic
-            if not first_action_logged:
-                gt_a0 = gt_actions[0] if len(gt_actions) > 0 else None
-                print(f"  [probe diag] pred_action (step 0, unnorm): {np.round(action_np, 3)}")
-                if gt_a0 is not None:
-                    print(f"  [probe diag] gt_action   (step 0, raw  ): {np.round(gt_a0, 3)}")
-                first_action_logged = True
+                if "Flow" in projector.__class__.__name__:
+                    z_dim = projector.latent_dim
+                    B_vla = vla_emb.size(0)
+                    z_t = torch.randn(B_vla, z_dim, device=vla_emb.device)
+                    dt = 1.0 / 10
+                    for i in range(10):
+                        t_steps = torch.ones(B_vla, device=vla_emb.device) * (i / 10.0)
+                        v = projector(vla_emb, z_t, t_steps)
+                        z_t = z_t + v * dt
+                    pred_mu = z_t
+                else:
+                    _, pred_mu, _ = projector(vla_emb)
+                    
+                if getattr(vae, 'use_state', False):
+                    state = np.concatenate((obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]))
+                    state_tensor = torch.tensor(state).float().to(device).unsqueeze(0)
+                    pred_chunk_norm = vae.decode(pred_mu, vae_text_emb, state_tensor)[0]
+                else:
+                    pred_chunk_norm = vae.decode(pred_mu, vae_text_emb)[0]
+
+            all_time_actions[t, t : t + chunk_size] = pred_chunk_norm.cpu().numpy()
+
+            start_idx = max(0, t - chunk_size + 1)
+            actions_for_curr_step = all_time_actions[start_idx : t + 1, t]
+
+            num_actions = len(actions_for_curr_step)
+            ages = np.arange(num_actions)[::-1]
+            weights = np.exp(-ensemble_k * ages)
+            weights = weights / weights.sum()
+
+            pred_action_norm = (actions_for_curr_step * weights[:, None]).sum(axis=0)
+            pred_action_norm = np.clip(pred_action_norm, -1.0, 1.0)
+
+            pred_action_unnorm = (pred_action_norm + 1.0) / 2.0 * (action_max.cpu().numpy() - action_min.cpu().numpy()) + action_min.cpu().numpy()
+            pred_action = pred_action_unnorm * action_mask.cpu().numpy() + pred_action_norm * (1.0 - action_mask.cpu().numpy())
+            action_np = pred_action.copy()
+            action_np[-1] = 1.0 if pred_action_norm[-1] > 0.0 else -1.0
 
             obs, reward, done, info = env.step(action_np)
             if done:
@@ -977,6 +1165,48 @@ def log_projector_video_probe(
             writer.append_data(cv2.resize(img, (224, 224), interpolation=cv2.INTER_CUBIC))
             if done:
                 break
+    else:
+        if exec_steps is None:
+            exec_steps = chunk_size
+        for t in range(0, seq_len, exec_steps):
+            if done:
+                break
+            obs_img_pil = Image.fromarray(obs['agentview_image'].astype(np.uint8))
+            with torch.no_grad():
+                vla_emb = emb_fn(obs_img_pil, instruction).to(device)
+                if normalize_emb:
+                    vla_emb = F.normalize(vla_emb, dim=-1)
+
+                if "Flow" in projector.__class__.__name__:
+                    z_dim = projector.latent_dim
+                    B_vla = vla_emb.size(0)
+                    z_t = torch.randn(B_vla, z_dim, device=vla_emb.device)
+                    dt = 1.0 / 10
+                    for i in range(10):
+                        t_steps = torch.ones(B_vla, device=vla_emb.device) * (i / 10.0)
+                        v = projector(vla_emb, z_t, t_steps)
+                        z_t = z_t + v * dt
+                    pred_mu = z_t
+                else:
+                    _, pred_mu, _ = projector(vla_emb)
+                pred_chunk_norm = vae.decode(pred_mu, vae_text_emb)
+
+            for k in range(exec_steps):
+                if t + k >= seq_len:
+                    break
+                pred_action_norm = pred_chunk_norm[0, k]
+                pred_action_unnorm = (pred_action_norm + 1.0) / 2.0 * (action_max - action_min) + action_min
+                pred_action = pred_action_unnorm * action_mask + pred_action_norm * (1.0 - action_mask)
+                action_np = pred_action.cpu().numpy()
+                action_np[-1] = 1.0 if action_np[-1] > 0.0 else -1.0
+
+                obs, reward, done, info = env.step(action_np)
+                if done:
+                    task_success = True
+                img = np.flipud(obs['agentview_image'])
+                writer.append_data(cv2.resize(img, (224, 224), interpolation=cv2.INTER_CUBIC))
+                if done:
+                    break
 
     writer.close()
     env.close()
@@ -984,11 +1214,12 @@ def log_projector_video_probe(
     print(f"  [probe] {split_name} probe outcome: {status}")
 
     if wandb.run is not None:
+        exec_tag = f"temporal_k{ensemble_k}" if temporal_ensemble else f"exec{exec_steps}"
         wandb.log({
-            f"eval_videos/projector_{split_name}_probe": wandb.Video(video_path, fps=30, format="mp4"),
-            f"eval_metrics/probe_{split_name}_success": float(task_success),
+            f"eval_videos/projector_{split_name}_{exec_tag}_{probe_task_name}": wandb.Video(video_path, fps=30, format="mp4"),
+            f"eval_metrics/{split_name}_success_{exec_tag}_{probe_task_name}": float(task_success),
             "global_step": step
-        })
+        }, step=step)
     print(f"🎥 Projector {split_name.upper()} Video uploaded to WandB!")
 
 def log_gt_video_probe(
@@ -1025,6 +1256,8 @@ def log_gt_video_probe(
         print(f"🧨 GT Video Probe Error: Could not find HDF5 at {hdf5_path}")
         return
     with h5py.File(hdf5_path, "r") as f:
+        demo_keys = sorted(list(f["data"].keys()), key=lambda x: int(x.split("_")[1]) if "_" in x and x.split("_")[1].isdigit() else 0)
+        probe_demo_id = demo_keys[0] if len(demo_keys) > 0 else "demo_0"
         gt_actions = f[f"data/{probe_demo_id}/actions"][:]
         init_state = f[f"data/{probe_demo_id}/states"][0]
 
@@ -1051,120 +1284,10 @@ def log_gt_video_probe(
         wandb.log({
             f"gt_videos/{split_name}_reference": wandb.Video(video_path, fps=30, format="mp4"),
             "global_step": step
-        })
+        }, step=step)
     print(f"🎥 GT {split_name.upper()} reference video uploaded to WandB!")
  
-def log_octo_gt_video_probe(
-    step, suite_name, stats_path, device,
-    probe_task_name, split_name,
-    octo_gt_fn, chunk_size=4,
-):
-    if not _HAS_LIBERO:
-        print("⚠️  LIBERO not available — skipping Octo GT video probe.")
-        return
-    os.environ.setdefault("MUJOCO_GL", "egl")
-    os.environ.pop("PYOPENGL_PLATFORM", None)
-    """
-    Octo GT video probe: runs the raw Octo model (no projector, no VAE) on the
-    live environment and logs the video to WandB.
 
-    The `octo_gt_fn` callable (from OctoWorker.make_gt_fn()) handles:
-      - 180° image rotation [::-1,::-1] matching Octo's training distribution
-      - 2-frame history window inside the child process
-      - sample_actions() with unnormalization
-
-    Gripper is binarised identically to the projector probe for fair comparison.
-
-    Args:
-        octo_gt_fn:  callable(image_np, instruction, reset=False) → (H, 7) np.ndarray
-                     where H is Octo's actual prediction horizon (typically 4).
-        chunk_size:  re-planning cadence — how many steps to execute before
-                     querying Octo again. Should match Octo's prediction horizon
-                     (4 for octo-base/small). Outer loop steps by len(action_chunk)
-                     so skipping never occurs even if this differs.
-    """
-    print(f"\n🎥 Generating Octo-GT {split_name.upper()} Video Probe for Step {step}...")
-    probe_demo_id = "demo_0"
-
-    # 1. Match task to benchmark
-    bmark = benchmark.get_benchmark_dict()[suite_name]()
-    task_id = None
-    for i in range(bmark.get_num_tasks()):
-        if bmark.get_task(i).name + '_demo' == probe_task_name:
-            task_id = i
-            break
-    if task_id is None:
-        print(f"⚠️ Octo GT probe task '{probe_task_name}' not found. Skipping.")
-        return
-
-    instruction = bmark.get_task(task_id).language
-
-    # 2. Load init state from HDF5
-    raw_suite_name = suite_name.replace("_no_noops", "")
-    data_dir = f"/mnt/Data/cjimenez/LIBERO/libero/datasets/{raw_suite_name}_no_noops_hdf5"
-    hdf5_path = os.path.join(data_dir, f"{probe_task_name}.hdf5")
-    if not os.path.exists(hdf5_path):
-        print(f"🧨 Octo GT Probe Error: Could not find HDF5 at {hdf5_path}")
-        return
-    with h5py.File(hdf5_path, "r") as f:
-        gt_actions = f[f"data/{probe_demo_id}/actions"][:]
-        init_state = f[f"data/{probe_demo_id}/states"][0]
-
-    # 3. Initialise MuJoCo environment
-    env_args = {"bddl_file_name": os.path.join(bmark.get_task_bddl_file_path(task_id))}
-    env = OffScreenRenderEnv(**env_args)
-    obs = env.reset()
-    env.set_init_state(init_state)
-    obs, _, _, _ = env.step(np.zeros(7))  # warmup step
-
-    video_path = f"/tmp/octo_gt_probe_{split_name}_{step}.mp4"
-    writer = imageio.get_writer(video_path, fps=30, macro_block_size=1)
-
-    seq_len = len(gt_actions)
-    done = False
-    t = 0
-
-    # 4. Chunk-based receding horizon: re-query Octo every len(action_chunk) steps.
-    # t increments by the ACTUAL number of actions returned, not a fixed chunk_size,
-    # so no demo steps are ever skipped regardless of Octo's prediction horizon.
-    while t < seq_len and not done:
-        # Pass raw env image; OctoWorker applies [::-1,::-1] internally
-        image_np = obs['agentview_image'].astype(np.uint8)
-        reset_hist = (t == 0)
-
-        try:
-            action_chunk = octo_gt_fn(image_np, instruction, reset=reset_hist)
-            # action_chunk: (H, 7) float32, already unnormalized
-        except Exception as exc:
-            print(f"[Octo GT probe] act_gt failed at t={t}: {exc}")
-            break
-
-        executed = 0
-        for k in range(len(action_chunk)):
-            if t + k >= seq_len:
-                break
-            action_np = action_chunk[k].copy()
-            # Binarise gripper (dim 6): positive → open (+1), negative → close (−1)
-            action_np[-1] = 1.0 if action_np[-1] > 0.0 else -1.0
-
-            obs, reward, done, info = env.step(action_np)
-            img = np.flipud(obs['agentview_image'])
-            writer.append_data(cv2.resize(img, (224, 224), interpolation=cv2.INTER_CUBIC))
-            executed += 1
-            if done:
-                break
-
-        t += executed if executed > 0 else len(action_chunk)  # advance past this chunk
-
-    writer.close()
-    env.close()
-
-    if wandb.run is not None:
-        wandb.log({
-            f"gt_videos/octo_gt_{split_name}_probe": wandb.Video(video_path, fps=30, format="mp4"),
-            "global_step": step
-        })
-    print(f"🎥 Octo GT {split_name.upper()} video uploaded to WandB!")
 
 class VLARAMDataset(Dataset):
     def __init__(self, images, instructions, actions):
@@ -1300,6 +1423,7 @@ def get_vla_projector_dataloader_cached(
     use_vision_pool=False,
     text_backbone="clip",
     vla_layer_idx=-1,
+    num_fusion_layers=1,
 ):
     """
     Protocol A (train_split_ratio=None, industry standard for LIBERO):
@@ -1334,90 +1458,249 @@ def get_vla_projector_dataloader_cached(
     is_cvae = (vae_type == "text_cvae")
     
     # Map the text dimension for fallback tensors
-    text_emb_dim = {"smollm": 960, "octo_t5": 768, "openvla_llama": 4096, "clip": 512}.get(text_backbone, 512)
+    text_emb_dim = {"smollm": 960, "openvla_llama": 4096, "clip": 512}.get(text_backbone, 512)
 
     # ---- 1. Load / build the cache ----------------------------------------
     if cache_path is not None and os.path.exists(cache_path):
         print(f"⚡ Loading pre-computed teacher targets from {cache_path}")
-        cached = torch.load(cache_path, map_location="cpu")
+        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
         _cache_save_path = cache_path
     elif fallback_cache_path is not None and os.path.exists(fallback_cache_path):
         print(f"⚡ Target cache not found — loading from fallback {fallback_cache_path} (will reteach + save to {cache_path})")
-        cached = torch.load(fallback_cache_path, map_location="cpu")
+        cached = torch.load(fallback_cache_path, map_location="cpu", weights_only=False)
         _cache_save_path = cache_path  # save reteached result to the correct target path
     else:
         cached = None
         _cache_save_path = cache_path
 
     if cached is not None:
-        # v2 cache has teacher_mu/lv; v1 cache has raw actions → upgrade in-place.
-        # If actions are present we can always re-teach cheaply (VAE encode only).
-        has_teacher = "train_teacher_mu" in cached
-        has_actions = "train_actions" in cached
-
-        if has_teacher and not has_actions:
-            # Old v2 without saved actions — load as-is, can't re-teach without full rebuild
-            train_emb        = cached["train_emb"]
-            train_teacher_mu = cached["train_teacher_mu"]
-            train_teacher_lv = cached["train_teacher_lv"]
-            train_clip_emb   = cached["train_clip_emb"]
-            test_emb         = cached["test_emb"]
-            test_teacher_mu  = cached["test_teacher_mu"]
-            test_teacher_lv  = cached["test_teacher_lv"]
-            test_clip_emb    = cached["test_clip_emb"]
-            # No actions saved — placeholder zeros (action recon loss disabled for this cache)
-            train_actions    = torch.zeros(len(train_emb), 8, 7)
-            test_actions     = torch.zeros(len(test_emb),  8, 7)
-            print("✅ v2 cache loaded.")
-        elif has_actions:
-            # v2 with actions (or v1): always recompute teacher targets from saved actions.
-            if has_teacher:
-                print("🔄 Cache has actions — recomputing teacher targets (VAE encode only).")
+        if "train_emb" not in cached:
+            print("⚡ Task-grouped cache format detected — flattening dynamically...")
+            unique_tasks = sorted(list(cached.keys()))
+            if train_split_ratio is None:
+                train_task_names = unique_tasks
+                held_out_task_names = []
+                print(f"🚀 Protocol A: training on ALL {len(train_task_names)} tasks — no held-out test split.")
             else:
-                print("⚠️  v1 cache detected — upgrading to v2 (CLIP + VAE encode only, no re-extraction).")
-            train_emb     = cached["train_emb"]
-            train_actions = cached["train_actions"]
-            test_emb      = cached["test_emb"]
-            test_actions  = cached["test_actions"]
-            
-            # Use dynamic text_emb_dim for fallbacks instead of hardcoded 512
-            train_clip_emb = cached.get("train_clip_emb", torch.zeros(len(train_emb), text_emb_dim))
-            test_clip_emb  = cached.get("test_clip_emb",  torch.zeros(len(test_emb),  text_emb_dim))
+                train_task_names = unique_tasks[:train_split_ratio]
+                held_out_task_names = unique_tasks[train_split_ratio:]
+                print(f"🔬 Protocol B: {len(train_task_names)} train tasks | {len(held_out_task_names)} held-out tasks")
 
-            assert vae is not None, "vae must be provided to compute teacher targets"
-            _vae_was_training = vae.training; vae.eval()
-            _is_cvae_local = (vae_type == "text_cvae")
+            def gather_task_data(task_names):
+                if not task_names:
+                    return torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0), []
+                
+                all_vla = []
+                all_mu = []
+                all_lv = []
+                all_actions = []
+                all_instrs = []
+                
+                for t in task_names:
+                    t_data = cached[t]
+                    vla = t_data["vla_emb"]
+                    if isinstance(vla, np.ndarray):
+                        vla = torch.from_numpy(vla)
+                    elif vla is None:
+                        raise ValueError(f"vla_emb is None for task {t}!")
+                    
+                    mu = t_data["train_mu"]
+                    if isinstance(mu, np.ndarray): mu = torch.from_numpy(mu)
+                    
+                    lv = t_data["train_logvar"]
+                    if isinstance(lv, np.ndarray): lv = torch.from_numpy(lv)
+                    
+                    acts = t_data["actions"]
+                    if isinstance(acts, np.ndarray): acts = torch.from_numpy(acts)
+                    
+                    all_vla.append(vla)
+                    all_mu.append(mu)
+                    all_lv.append(lv)
+                    all_actions.append(acts)
+                    
+                    instr = t.replace("_demo", "").replace("_", " ")
+                    all_instrs.extend([instr] * len(vla))
+                    
+                flat_vla = torch.cat(all_vla, dim=0).float()
+                flat_mu = torch.cat(all_mu, dim=0).float()
+                flat_lv = torch.cat(all_lv, dim=0).float()
+                flat_acts = torch.cat(all_actions, dim=0).float()
+                
+                return flat_vla, flat_mu, flat_lv, flat_acts, all_instrs
 
-            def _reteach(actions, text_embs):
-                if len(actions) == 0:
-                    return torch.empty(0), torch.empty(0)
-                all_mu, all_lv = [], []
-                for i in tqdm.tqdm(range(0, len(actions), 256), desc="Re-teaching"):
-                    a = actions[i:i+256].to(device)
-                    t_emb = text_embs[i:i+256].to(device)
-                    with torch.no_grad():
-                        if _is_cvae_local:
-                            # mu, lv = vae.encode(a, t_emb)
-                            zero_t = torch.zeros(a.size(0), t_emb.shape[-1], device=device)
-                            mu, lv = vae.encode(a, zero_t)
-                        else:
-                            mu, lv = vae.encode(a)
-                    all_mu.append(mu.float().cpu()); all_lv.append(lv.float().cpu())
-                return torch.cat(all_mu), torch.cat(all_lv)
+            tr_emb, train_teacher_mu, train_teacher_lv, tr_acts_raw, train_instrs = gather_task_data(train_task_names)
+            te_emb, test_teacher_mu,  test_teacher_lv,  te_acts_raw, test_instrs  = gather_task_data(held_out_task_names)
 
-            train_teacher_mu, train_teacher_lv = _reteach(train_actions, train_clip_emb)
-            test_teacher_mu,  test_teacher_lv  = _reteach(test_actions,  test_clip_emb)
-            if _vae_was_training: vae.train()
+            # Load action stats for normalization
+            stats_path = "./checkpoints/text_tcvae/libero_spatial/dataset_statistics.pt"
+            if os.path.exists(stats_path):
+                action_stats = torch.load(stats_path, map_location="cpu", weights_only=False)
+                suite_name_in_stats = f"{suite}_no_noops"
+                if suite_name_in_stats not in action_stats:
+                    suite_name_in_stats = "libero_spatial_no_noops"
+                stats = action_stats[suite_name_in_stats]['action']
+                a_min_t = torch.tensor(stats['min'], dtype=torch.float32)
+                a_max_t = torch.tensor(stats['max'], dtype=torch.float32)
+                rng     = (a_max_t - a_min_t).clamp(min=1e-6)
+                
+                # Normalize train
+                if len(tr_acts_raw) > 0:
+                    train_actions = 2.0 * (tr_acts_raw - a_min_t) / rng - 1.0
+                    if 'mask' in stats:
+                        mask_t = torch.tensor(stats['mask'], dtype=torch.float32)
+                        train_actions = train_actions * mask_t + tr_acts_raw * (1.0 - mask_t)
+                else:
+                    train_actions = tr_acts_raw
+                
+                # Normalize test
+                if len(te_acts_raw) > 0:
+                    test_actions = 2.0 * (te_acts_raw - a_min_t) / rng - 1.0
+                    if 'mask' in stats:
+                        mask_t = torch.tensor(stats['mask'], dtype=torch.float32)
+                        test_actions = test_actions * mask_t + te_acts_raw * (1.0 - mask_t)
+                else:
+                    test_actions = te_acts_raw
+            else:
+                print(f"⚠️  No stats file at {stats_path} — actions will NOT be normalised.")
+                train_actions = tr_acts_raw
+                test_actions = te_acts_raw
 
-            torch.save({
-                "train_emb": train_emb, "train_teacher_mu": train_teacher_mu,
-                "train_teacher_lv": train_teacher_lv, "train_clip_emb": train_clip_emb,
-                "train_actions": train_actions,
-                "test_emb": test_emb, "test_teacher_mu": test_teacher_mu,
-                "test_teacher_lv": test_teacher_lv, "test_clip_emb": test_clip_emb,
-                "test_actions": test_actions,
-            }, _cache_save_path)
-            print(f"💾 Cache updated with fresh teacher targets → {_cache_save_path}")
+            from transformers import AutoTokenizer, AutoModel, CLIPTokenizer, CLIPTextModel
+            print(f"\n📝 Pre-computing text embeddings using {text_backbone}...")
+            if text_backbone == "smollm":
+                model_id = "HuggingFaceTB/SmolLM2-360M-Instruct"
+                tokenizer = AutoTokenizer.from_pretrained(model_id)
+                if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+                text_encoder = AutoModel.from_pretrained(model_id).to(device).eval()
+                max_len = 128
+            elif text_backbone == "openvla_llama":
+                model_id = "meta-llama/Llama-2-7b-hf"
+                tokenizer = AutoTokenizer.from_pretrained(model_id)
+                if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+                text_encoder = AutoModel.from_pretrained(model_id).to(device).eval()
+                max_len = 128
+            else: # CLIP
+                model_id = "openai/clip-vit-base-patch32"
+                tokenizer = CLIPTokenizer.from_pretrained(model_id)
+                text_encoder = CLIPTextModel.from_pretrained(model_id).to(device).eval()
+                max_len = 77
+
+            for p in text_encoder.parameters(): p.requires_grad = False
+            text_cache = {}
+
+            def embed_text(instructions):
+                all_text = []
+                for instr in tqdm.tqdm(instructions, desc=f"{text_backbone} text emb"):
+                    if instr not in text_cache:
+                        toks = tokenizer(
+                            [instr], return_tensors="pt", padding=True, truncation=True, max_length=max_len
+                        ).to(device)
+                        with torch.no_grad():
+                            if text_backbone == "clip":
+                                emb = text_encoder(**toks).pooler_output[0]
+                            else:
+                                outputs = text_encoder(**toks)
+                                hidden_states = outputs.last_hidden_state
+                                mask = toks.attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+                                sum_embeddings = torch.sum(hidden_states * mask, dim=1)
+                                sum_mask = torch.clamp(mask.sum(dim=1), min=1e-9)
+                                emb = (sum_embeddings / sum_mask)[0]
+                            text_cache[instr] = emb.float().cpu()
+                    all_text.append(text_cache[instr])
+                return torch.stack(all_text) if all_text else torch.zeros(0, text_emb_dim)
+
+            train_clip_emb = embed_text(train_instrs)
+            test_clip_emb = embed_text(test_instrs)
+
+            text_encoder.cpu(); del text_encoder, tokenizer; torch.cuda.empty_cache()
+
+            train_emb = tr_emb
+            test_emb = te_emb
+
+            if cache_path is not None:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                torch.save({
+                    "train_emb":        train_emb,
+                    "train_teacher_mu": train_teacher_mu,
+                    "train_teacher_lv": train_teacher_lv,
+                    "train_clip_emb":   train_clip_emb,
+                    "train_actions":    train_actions,
+                    "test_emb":         test_emb,
+                    "test_teacher_mu":  test_teacher_mu,
+                    "test_teacher_lv":  test_teacher_lv,
+                    "test_clip_emb":    test_clip_emb,
+                    "test_actions":     test_actions,
+                }, cache_path)
+                print(f"💾 Flattened v2 cache saved to {cache_path}")
+        else:
+            # v2 cache has teacher_mu/lv; v1 cache has raw actions → upgrade in-place.
+            # If actions are present we can always re-teach cheaply (VAE encode only).
+            has_teacher = "train_teacher_mu" in cached
+            has_actions = "train_actions" in cached
+
+            if has_teacher and not has_actions:
+                # Old v2 without saved actions — load as-is, can't re-teach without full rebuild
+                train_emb        = cached["train_emb"]
+                train_teacher_mu = cached["train_teacher_mu"]
+                train_teacher_lv = cached["train_teacher_lv"]
+                train_clip_emb   = cached["train_clip_emb"]
+                test_emb         = cached["test_emb"]
+                test_teacher_mu  = cached["test_teacher_mu"]
+                test_teacher_lv  = cached["test_teacher_lv"]
+                test_clip_emb    = cached["test_clip_emb"]
+                # No actions saved — placeholder zeros (action recon loss disabled for this cache)
+                train_actions    = torch.zeros(len(train_emb), 8, 7)
+                test_actions     = torch.zeros(len(test_emb),  8, 7)
+                print("✅ v2 cache loaded.")
+            elif has_actions:
+                # v2 with actions (or v1): always recompute teacher targets from saved actions.
+                if has_teacher:
+                    print("🔄 Cache has actions — recomputing teacher targets (VAE encode only).")
+                else:
+                    print("⚠️  v1 cache detected — upgrading to v2 (CLIP + VAE encode only, no re-extraction).")
+                train_emb     = cached["train_emb"]
+                train_actions = cached["train_actions"]
+                test_emb      = cached["test_emb"]
+                test_actions  = cached["test_actions"]
+                
+                # Use dynamic text_emb_dim for fallbacks instead of hardcoded 512
+                train_clip_emb = cached.get("train_clip_emb", torch.zeros(len(train_emb), text_emb_dim))
+                test_clip_emb  = cached.get("test_clip_emb",  torch.zeros(len(test_emb),  text_emb_dim))
+
+                assert vae is not None, "vae must be provided to compute teacher targets"
+                _vae_was_training = vae.training; vae.eval()
+                _is_cvae_local = (vae_type == "text_cvae")
+
+                def _reteach(actions, text_embs):
+                    if len(actions) == 0:
+                        return torch.empty(0), torch.empty(0)
+                    all_mu, all_lv = [], []
+                    for i in tqdm.tqdm(range(0, len(actions), 256), desc="Re-teaching"):
+                        a = actions[i:i+256].to(device)
+                        t_emb = text_embs[i:i+256].to(device)
+                        with torch.no_grad():
+                            if _is_cvae_local:
+                                # mu, lv = vae.encode(a, t_emb)
+                                zero_t = torch.zeros(a.size(0), t_emb.shape[-1], device=device)
+                                mu, lv = vae.encode(a, zero_t)
+                            else:
+                                mu, lv = vae.encode(a)
+                        all_mu.append(mu.float().cpu()); all_lv.append(lv.float().cpu())
+                    return torch.cat(all_mu), torch.cat(all_lv)
+
+                train_teacher_mu, train_teacher_lv = _reteach(train_actions, train_clip_emb)
+                test_teacher_mu,  test_teacher_lv  = _reteach(test_actions,  test_clip_emb)
+                if _cache_save_path is not None:
+                    os.makedirs(os.path.dirname(_cache_save_path), exist_ok=True)
+                    torch.save({
+                        "train_emb": train_emb, "train_teacher_mu": train_teacher_mu,
+                        "train_teacher_lv": train_teacher_lv, "train_clip_emb": train_clip_emb,
+                        "train_actions": train_actions,
+                        "test_emb": test_emb, "test_teacher_mu": test_teacher_mu,
+                        "test_teacher_lv": test_teacher_lv, "test_clip_emb": test_clip_emb,
+                        "test_actions": test_actions,
+                    }, _cache_save_path)
+                    print(f"💾 Cache updated with fresh teacher targets → {_cache_save_path}")
     else:
         # ---- 1a. Gather raw data -----------------------------------------------
         suite_name = f'{suite}_no_noops'
@@ -1571,10 +1854,6 @@ def get_vla_projector_dataloader_cached(
             model_id = "HuggingFaceTB/SmolLM2-360M-Instruct"
             tokenizer = AutoTokenizer.from_pretrained(model_id)
             if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-            text_encoder = AutoModel.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device).eval()
-        elif text_backbone == "octo_t5":
-            model_id = "t5-base"
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
             text_encoder = AutoModel.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device).eval()
         elif text_backbone == "openvla_llama":
             model_id = "meta-llama/Llama-2-7b-hf"
